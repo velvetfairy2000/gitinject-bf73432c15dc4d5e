@@ -1,0 +1,31 @@
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Coverage reports
+.coverage
+coverage.xml
+htmlcov/
+
+# Test cache
+.pytest_cache/
+
+# Virtual environments
+venv/
+env/
+.venv/
+.venv-wsl/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Test planning documents (local development only)
+TEST_PLAN.md

@@ -1,0 +1,83 @@
+name: Claude Code
+run-name: Experiment ${{ github.event_name }} ${{ github.event.issue.number || github.event.inputs.issue_number }}
+
+on:
+  issues:
+    types: [opened, reopened]
+  issue_comment:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: 'Issue number to process'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+  id-token: write
+
+jobs:
+  claude:
+    runs-on: ubuntu-latest
+    # Skip bot comments and PR comments
+    if: |
+      github.event_name == 'issues' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'issue_comment' &&
+       github.event.comment.user.type != 'Bot' &&
+       !github.event.issue.pull_request)
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Resolve issue number
+        id: issue
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "number=${{ inputs.issue_number }}" >> $GITHUB_OUTPUT
+          elif [ "${{ github.event_name }}" = "issue_comment" ]; then
+            echo "number=${{ github.event.issue.number }}" >> $GITHUB_OUTPUT
+          else
+            echo "number=${{ github.event.issue.number }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run Claude
+        uses: anthropics/claude-code-action@v1
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          allowed_non_write_users: "*"
+          show_full_output: true
+          claude_args: "--model claude-sonnet-4-6 --max-turns 80"
+          prompt: |
+            Read AGENT_SYSTEM_PROMPT.md — this is your complete behavioral guide for this repository.
+            It defines what is actionable, how to implement fixes, branch naming, release process, and all rules.
+
+            Also read CLAUDE.md for project architecture and technical context.
+
+            Then process issue #${{ steps.issue.outputs.number }}:
+
+            Fetch the full issue:
+              gh issue view ${{ steps.issue.outputs.number }} --repo ${{ github.repository }}
+
+            Fetch all comments:
+              gh issue view ${{ steps.issue.outputs.number }} --repo ${{ github.repository }} --comments
+
+            Issue body excerpt (may be truncated by GitHub Actions):
+            ${{ github.event.issue.body }}${{ github.event.comment.body }}
+
+            IMPORTANT — Images and attachments:
+            If the issue body or any comment contains image URLs in markdown format like
+            ![description](https://github.com/user-attachments/assets/...), download each one:
+              curl -sL "<url>" -o /tmp/issue_img_<N>.png
+            Then view each file using the Read tool — images often contain critical diagnostic
+            data (sensor lists, livedata JSON, error messages) not described in the text.
+
+            Follow the decision tree in AGENT_SYSTEM_PROMPT.md to determine whether this issue
+            is actionable, needs a reply, or should be skipped entirely.

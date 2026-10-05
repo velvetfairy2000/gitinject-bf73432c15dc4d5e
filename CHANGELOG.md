@@ -1,0 +1,581 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [1.7.34] - 2026-10-05
+
+### Fixed
+- **Deprecation warnings from `DeviceEntry.config_entries` on Home Assistant 2026.10**: the stale "unknown" gateway clean-up at setup and the `update_data` / `refresh_mapping` services no longer read the deprecated property (removed in HA 2027.10). New `device_compat` helpers use `config_entry_id` / `async_get_device_and_config_entry_for_domain` where available and fall back to `config_entries` on older HA. Credit to @RavenX447l (issue #267, PR #268).
+- **hassfest failure**: removed `aiohttp` from the manifest `requirements`; hassfest now rejects it because it is a Home Assistant core dependency.
+
+## [1.7.33] - 2026-09-30
+
+### Fixed
+- **Lightning Strikes had no `state_class`, so Home Assistant kept no long-term statistics for it**: `lightning_num` (WH57) is now `total_increasing`, matching Home Assistant core's `ecowitt` integration. A drop back to 0 is recorded as a new counter cycle rather than a negative change. Credit to @olympia (issue #264).
+
+## [1.7.32] - 2026-09-28
+
+### Fixed
+- **Solar radiation showed an invalid unit ("Kfc") for the `irradiance` device class**: some gateways can be configured to report solar radiation in kilo foot-candles instead of W/m² or lux, embedding the unit directly in the value string (e.g. `"2.0 Kfc"`). `Kfc` was passed straight through as `unit_of_measurement`, which Home Assistant rejects for the `irradiance` device class (it only accepts `W/m²` or `BTU/(h⋅ft²)`), producing the "native unit of measurement 'Kfc' is not a valid unit for the device class" warning. `Kfc` is now converted the same way the existing `Klux` case already is: the value is multiplied by 10763.91 to get lux, and the entity's `device_class` switches from `irradiance` to `illuminance` to match. (issue #259)
+
+## [1.7.31] - 2026-09-25
+
+### Fixed
+- **Rolling-window rain sensors declared the wrong state class**: `hourlyrainin`/`0x7D` (Hourly Rain) and `0x7C` (24-Hour Rain) are rolling-window totals that drop as older rain leaves the window, but were declared `total_increasing`, which Home Assistant expects to be strictly non-decreasing. Small drops logged `"state is not strictly increasing"`; larger drops (≥10%) were interpreted by the recorder as a meter reset, corrupting the long-term statistics sum. They're now `measurement`, which correctly tracks a value that can go up or down without implying a cumulative sum. Event Rain (`eventrainin`/`0x0D`) was declared `total`, under which a decrease is subtracted from the running sum — so the drop to 0 at the end of every rain event canceled that event's rain out of the long-term total. It's now `total_increasing`, treating each drop to 0 as the start of a new counter cycle instead of a negative delta. Daily/weekly/monthly/yearly/total rain were already correct and are unchanged. A new test (`test_sensor_types_cumulative_state_classes`) asserts every rolling-window key is `measurement` and every restarting-counter key is `total_increasing`, and fails if any other sensor is given a cumulative state class without being reviewed. Credit to @olympia for the report, fix, and tests (PR #255). Home Assistant will show a one-time repair on Developer Tools → Statistics for the affected entities after updating, since their state class changed — this is expected; resolve it there (e.g. by clearing the old statistics).
+
+## [1.7.30] - 2026-09-21
+
+### Fixed
+- **v1.7.29's `device_registry.devices` deprecation fix didn't actually fix it**: v1.7.29 replaced `device_registry.devices.values()` with `device_registry.devices.get_entry(...)`, but on HA 2026.9+ `device_registry.devices` is a `_DeprecatedDeviceRegistryItemsView` whose `__getattr__` reports the exact same deprecation warning for *any* attribute access other than `__iter__`/`__len__`/`__contains__`/`__getitem__` — including `.get_entry`. So the warning fired from the same line, for the same reason, just via a different method name. (Thanks to @olympia for the detailed root-cause writeup, including why the existing test's `MagicMock` masked the bug — it resolves any attribute name and can't reproduce the view's `__getattr__` semantics.) The helper now iterates `device_registry.devices` instead, which is the one access pattern the deprecated view doesn't warn on. What that iteration yields differs by HA version, so the helper handles both shapes: HA 2026.9+'s view yields `DeviceEntry` objects directly, while older HA (back to this integration's minimum supported 2026.1.0) has `.devices` as a plain dict-like container where iterating yields device-id strings that still need a `[]` lookup to resolve to the entry — a lookup that isn't deprecated on those older versions, since the deprecated view doesn't exist there yet. The regression test now uses a fake object that reproduces the deprecated view's real `__getattr__` behavior instead of a bare `MagicMock`, so a future regression to `.get_entry()`/`.values()` would fail the test instead of passing silently. (issue #251)
+
+## [1.7.29] - 2026-09-18
+
+### Fixed
+- **Deprecated `device_registry.devices` mapping usage**: `device_compat.py`'s identifier-lookup helper (used by every gateway/ghost-device lookup and the migration logic in `__init__.py`) iterated `device_registry.devices.values()` to find a device by identifier. HA core now deprecates treating `device_registry.devices` as a mapping (`.values()`, `.items()`, `[key]`, `in`) and warns this will stop working in HA 2027.9.0. The helper now uses the registry's own `get_entry(identifiers=...)` lookup method instead — the identifier-indexed lookup the mapping behavior used to provide — which predates this deprecation and works across HA versions. (issue #251)
+
+## [1.7.28] - 2026-09-09
+
+### Fixed
+- **WH69 battery showed 0% (Ecowitt's own dashboard reported "normal")**: v1.7.26's fallback that gives the losing device in a WN20/WH69/WH40 rain-block tie-break its own battery entity from `get_sensors_info`'s `batt` field always treated that value as a 0-5 bar scale (`batt × 20%`). WH69/WH65 (and, per the spec, WH40/WN20 as well) can instead report raw binary battery (0=normal, 1=low) through this field, so a `batt` of `"0"` was read as 0 bars (0%) instead of "normal" (100%). The fallback now applies the same binary-vs-bar-scale heuristic already used for the direct rain-block battery extraction: a raw `"0"` or `"1"` from `get_sensors_info` is treated as binary for these tipping-bucket devices, instead of being unconditionally multiplied by 20. (issue #239)
+
+## [1.7.27] - 2026-09-08
+
+### Added
+- **"Resync Sensor Mappings" button**: Each gateway device now has a diagnostic button entity (`button.ecowitt_gateway_<id>_resync_mapping`) that immediately re-runs the `get_sensors_info` mapping refresh and a full data refresh, instead of waiting for the periodic mapping-update interval. Useful when changing sensor assignments (adding/removing/moving/renaming a sensor) on the gateway and wanting Home Assistant to pick it up right away. Reuses the existing `async_refresh_mapping()` coordinator method that already backs the `ecowitt_local.refresh_mapping` service. (issue #246)
+- **Manual removal of stale sensor devices**: A sensor device whose hardware ID is no longer reported by `get_sensors_info` (e.g. permanently removed or replaced) can now be deleted from **Settings → Devices & Services → Ecowitt Local** using Home Assistant's standard device-delete option, instead of only being disableable. The gateway device itself, and any hardware ID the gateway is still actively reporting, remain protected from accidental removal — deleting an active sensor would just have it reappear on the next mapping poll. (issue #245)
+- **User-assigned gateway sensor names used as device names**: If a sensor has been given a custom name on the Ecowitt gateway itself (e.g. "Deep Freezer" instead of the default "Temp & Humidity CH2"), that name is now used as the Home Assistant device's suggested name. Detected by the absence of the default "CH{n}" pattern in the gateway's reported sensor name, so newly discovered sensors are immediately identifiable without manually renaming each device. Sensors left with their default gateway name are unaffected. (issue #243)
+
+### Fixed
+- **Deprecated `device_registry.async_get_device()` calls**: Newer Home Assistant core releases warn (and will eventually stop working) when integrations call `async_get_device(identifiers=...)`, since device identifiers are no longer guaranteed unique across config entries. All five call sites (`__init__.py` gateway/ghost-device lookups and migration logic, `device_compat.py`'s via-device resolution) now use a small identifier-scoped lookup helper instead, avoiding the deprecated method entirely. (issue #241)
+
+## [1.7.26] - 2026-09-07
+
+### Fixed
+- **WH69 lost its rain and battery entities when a WN20 was also registered on the same gateway**: v1.7.23 fixed WN20 having no entities by always attributing the top-level `rain` block to WN20 whenever one was registered, ahead of WH69. That static priority broke the setup it was meant to fix for other users: when a WH69 is the genuinely active tipping-bucket source and a WN20 is also registered (but not actually reporting rain), the `rain` block was forced onto WN20 anyway, taking away WH69's rain readings and its only source of battery data. The rain block is now attributed to whichever registered candidate (WN20, WH69, WH40) reports the strongest signal, so a real, actively-reporting WH69 is no longer starved by a WN20 that merely exists in the sensor list; the WN20 > WH69 > WH40 order is now only a tie-break when signal can't distinguish them. Additionally, whichever device doesn't win the rain block now still gets its own battery entity sourced directly from `get_sensors_info`'s `batt` field, instead of losing its battery entity entirely. (issue #239)
+
+## [1.7.24] - 2026-09-05
+
+### Added
+- **Reconfigure flow**: the gateway's IP address (and password) can now be updated from the Home Assistant UI without removing and re-adding the integration, so existing devices, entities, and any automations that reference them are preserved. Previously the only way to move to a new IP after a DHCP lease change was to delete and recreate the config entry.
+- **MAC-based unique ID**: when the gateway exposes its network info (`/get_network_info`), its MAC address — stable across IP changes, unlike the host address previously used — becomes the config entry's unique ID. Gateways where this isn't available fall back to the previous model+host scheme. Existing (legacy) entries transparently adopt the MAC-based ID the first time they're reconfigured; the strict "same physical device" check only applies once both the old and new IDs are MAC-based, so this upgrade never triggers a false "wrong device" abort.
+
+### Fixed
+- **Gateway model always showed as "Unknown" in the config flow on gateways that omit `stationtype` from `/get_version`**: some real-world gateways report only a `version` string (e.g. `"Version: GW1100A_V2.4.5"`) with no dedicated `stationtype` field. The config flow now falls back to parsing the model out of that string, reusing the same parsing already relied on elsewhere in the integration for the live gateway device info.
+
+## [1.7.23] - 2026-09-04
+
+### Fixed
+- **WN20 rain gauge showed zero entities when a WH69 was also present on the same gateway**: The top-level `rain` block's readings were force-attributed to the WH69 device whenever a WH69 was registered, ahead of WN20, on the assumption that WH69 is always the tipping-bucket source for that block. But WH69 already reports its own rain readings via `common_list` hex IDs, so when a separate physical WN20 rain gauge is also paired, the `rain` block actually belongs to the WN20 — not the WH69. All of the WN20's readings (and its battery) were silently merged into the WH69 device instead of creating the WN20's own entities, leaving the WN20 device with none. The priority order now checks WN20 first, so it correctly claims the `rain` block when present; WH69 remains the fallback for gateways that report WH69's rain only through this block and have no WN20 (issue #95), and WH40 remains the last fallback. (issue #239)
+
+## [1.7.22] - 2026-09-02
+
+### Added
+- **Italian translation** for the config/options flow and services, contributed by @damianog (PR #236).
+- **Danish translation** for the config/options flow and services, contributed by @HThuren (PR #221).
+
+## [1.7.21] - 2026-08-29
+
+### Fixed
+- **Entity creation crashed on newer HA core betas with `RuntimeError: ... calls device_registry.async_get_or_create with a deprecated via_device parameter`**: HA core is removing the `via_device` identifier-tuple parameter (used to link a sensor's device to its gateway) in favor of a pre-resolved `via_device_id`. On HA builds that already enforce this, adding any per-sensor device (e.g. a WS90's Outdoor Temp) raised instead of merely logging a deprecation warning, so the entity was silently dropped. A new compatibility helper detects at runtime whether the installed HA core still expects `via_device` or now requires `via_device_id`, resolving the gateway's registry device id when needed, so device linking keeps working on both older and newer HA core releases. (issue #232)
+
+## [1.7.20] - 2026-08-27
+
+### Fixed
+- **WH68 weather station entities were created under the gateway device instead of the WH68 device**: The WH68 sensor-type mapping only generated the legacy flat WU-style live-data keys (`tempf`, `windspeedmph`, `solarradiation`, `uv`, etc.). Newer gateway firmware (e.g. GW1100A) instead reports WH68 readings through `common_list` hex IDs, same as WH69/WS90 but without rain (WH68 has no rain gauge). Since none of those hex IDs were in the WH68 key list, `get_hardware_id()` returned `None` for them, so the readings fell through to the gateway device while the WH68 device itself was created with zero entities. The WH68 key list now also includes the relevant common_list hex IDs (temperature, dew point, wind chill, heat index, humidity, wind direction/speed/gust, max daily gust, solar radiation, UV) alongside the existing flat keys, so WH68 entities are correctly attached to their own device regardless of which format the gateway reports. (issue #231)
+
+## [1.7.19] - 2026-08-20
+
+### Added
+- **RSSI and Signal Quality diagnostic sensors**: `get_sensors_info` reports both a coarse `signal` bar (0-4, exposed today as the "Signal Strength" %) and a raw `rssi` dBm value for every sensor, but only `signal` was ever read. The 0-4 scale is too coarse to tell a marginal link from an excellent one — two sensors can both report `signal: 4` (100%) while one sits at -36 dBm and the other at -101 dBm. Two new diagnostic entities now surface the raw value: `sensor.ecowitt_rssi_<hw>` (the raw dBm reading, `device_class: signal_strength`) and `sensor.ecowitt_signal_quality_<hw>` (a linear 0-100% derived from rssi: `2*(rssi_dbm+100)`, clamped, so -100 dBm → 0% and -50 dBm → 100%). Both are skipped when the gateway doesn't report `rssi` for a sensor (missing field or `"--"`) or reports a non-numeric value. (issue #228)
+
+## [1.7.18] - 2026-08-18
+
+### Fixed
+- **`last_seen`/`last_update` still forced a recorder `states` row every poll after v1.7.16**: The v1.7.16 fix marked `last_seen` as `_unrecorded_attributes`, which stops the *attribute blob* from being persisted to the `state_attributes` table, but doesn't affect whether Home Assistant considers the poll a state change in the first place — that comparison happens on the full attribute dict before `_unrecorded_attributes` is ever consulted. Since `last_seen` still changed every poll, the attributes dict was never equal to the previous poll's, so HA still emitted a full `state_changed` event and the recorder still wrote a `states` row every poll, even when the sensor's value hadn't moved. The `last_seen` attribute (and the equivalent raw `last_update` value previously leaking through on `EcowittStateBinarySensor`, e.g. `binary_sensor.ecowitt_rain_*`) is now removed from entity attributes entirely instead of merely marked unrecorded, so unchanged-value polls compare equal and take Home Assistant's quiet `last_reported`-only path with no recorder write at all. Home Assistant's built-in `last_reported` timestamp (visible in the entity's more-info dialog, core since 2024.7) already answers "when did we last hear from this sensor" without this problem. (issue #223)
+
+## [1.7.17] - 2026-08-17
+
+### Fixed
+- **LDS01 liquid depth sensor entities could collide with other unregistered channel sensors**: The LDS01 (Ecowitt's current liquid-depth sensor) shares its livedata format with the already-supported WH54, but on some gateways it never appears in `get_sensors_info` at all — not even as an `FFFFFFFE` placeholder — so the integration has no hardware ID to build a dedicated device from. In that case entities fall back to a generic `sensor.ecowitt_<type>_ch{N}` ID. For the LDS battery and voltage keys specifically, that fallback collapsed to the same generic `sensor.ecowitt_battery_ch{N}` / `sensor.ecowitt_voltage_ch{N}` IDs used by other unregistered channel-based sensors (e.g. WH34 temperature-probe battery, WH35 leaf-wetness battery), so an LDS01 sharing a channel number with one of those would silently overwrite or get renamed away from it in the entity registry. LDS battery and voltage keys now resolve to distinct `lds_battery`/`lds_voltage` entity-ID segments (e.g. `sensor.ecowitt_lds_battery_ch1`), so they can no longer collide with another sensor type's fallback entity. (issue #220)
+
+## [1.7.16] - 2026-08-10
+
+### Fixed
+- **`last_seen` attribute forced a recorder write on every poll for every entity**: The per-entity `last_seen` attribute (populated from the sensor's `last_update` timestamp) changed on every coordinator poll regardless of whether the underlying sensor value changed, causing Home Assistant's recorder to log a new `states`/`state_attributes` row every poll cycle for every entity. On a busy install this dominated recorder database growth. `last_seen` is now marked as an unrecorded attribute (`_unrecorded_attributes`) on sensor and per-sensor online binary-sensor entities, so it's still visible live in the entity's current state but is no longer persisted to history/logbook on every poll. The attribute itself is unchanged and continues to work in dashboards and templates — this only affects what gets written to the recorder database. (issue #223)
+
+## [1.7.15] - 2026-08-01
+
+### Added
+- **French translation**: Added `fr.json` covering the config flow, options flow, and service names/descriptions, contributed by @DuchkPy. (#213)
+
+## [1.7.14] - 2026-07-28
+
+### Fixed
+- **Battery entity icon never adjusts to the actual battery level**: The dynamic battery icon (`mdi:battery-outline` through `mdi:battery`, scaled to the reported percentage) only applied when the entity's `category` was the literal string `"battery"`. In real coordinator output, battery entities are always assigned `category = "diagnostic"` (they were intentionally moved into the diagnostic category), so that condition never matched and every battery entity fell back to the static `mdi:battery` icon regardless of charge level. The fix checks `device_class == SensorDeviceClass.BATTERY` instead of the category string — consistent with how the icon property itself already determines whether an entity is a battery sensor — so the icon now correctly reflects the reported battery percentage. (issue #217)
+
+## [1.7.13] - 2026-07-27
+
+### Fixed
+- **Options flow crashed with `AttributeError: 'OptionsFlowHandler' object has no attribute 'config_entry'`**: A further Home Assistant core change removed the `config_entry` attribute from `OptionsFlow` entirely (a step beyond the read-only-property change already handled for issues #50/#42/#31). Opening the integration's "Configure" dialog raised this error immediately instead of showing the options form. `OptionsFlowHandler` now resolves its config entry via `hass.config_entries.async_get_entry(self.handler)` instead of relying on the removed attribute.
+
+## [1.7.12] - 2026-07-27
+
+### Fixed
+- **A sensor's diagnostic entities (signal strength, online status) permanently stop updating after HA restart or config entry reload if the sensor's data is briefly missing at that exact moment**: Entities were only ever created once, from a single snapshot of coordinator data taken during platform setup. A sensor with a marginal RF link that happens to be mid-dropout at the instant Home Assistant restarts or the config entry reloads would never get an entity created for it — the sensor's primary readings (e.g. soil moisture) could keep updating fine via a previously-created entity, but its `signal_strength` sensor and `_online` binary sensor (created only if present at that same setup snapshot) would be stuck in a stale "restored" state forever, since nothing ever asked to create them once the data reappeared. Reloading the config entry as a workaround just moved the problem to whichever sensor happened to be mid-dropout during *that* reload. The fix adds a coordinator listener to both the sensor and binary_sensor platforms that creates entities for any sensor/hardware ID first seen in a later poll, not just the initial one, so a transiently-missing sensor gets its entities created as soon as its data reappears rather than never. (issue #207)
+
+## [1.7.11] - 2026-07-11
+
+### Fixed
+- **WN31 (and other channel sensors) silently drop one channel when two sensors share the same hardware ID**: If two physical sensors of the same type (e.g. two WN31 temperature/humidity sensors) report an identical hardware ID to the gateway — which can happen as a factory defect or after a battery replacement — only one of the two channels would appear in Home Assistant. The `_sensor_info` dictionary, keyed by hardware ID, was overwritten by whichever channel was processed last, causing both channels to generate the same entity ID and only the final one to survive. The fix pre-scans the `get_sensors_info` response to detect hardware IDs that appear on multiple channels. When a duplicate is found, a composite identifier (`{hardware_id}_ch{channel}`, e.g. `B8_ch3` and `B8_ch5`) is used for each channel, so both sensors get distinct HA devices and entity IDs. Non-duplicate sensors are unaffected. (issue #211)
+
+## [1.7.10] - 2026-07-06
+
+### Fixed
+- **WH90/WS90 Solar Radiation shows lx unit with wrong name when gateway is in lux mode**: When a gateway paired with a WH90 or WS90 is configured to output solar radiation in lux, the `0x15` common_list key arrives with a `lx` unit. The integration correctly set the device class to `illuminance` but left the entity named "Solar Radiation" (wrong) and did not create a derived "Solar Radiation" entity in W/m². The fix extends the lux-mode handling (previously only applied to the non-hex `solarradiation` key used by WH68) to also cover the `0x15` hex key: the primary entity is now renamed to "Solar Illuminance" (lx, illuminance class), and a derived "Solar Radiation" entity in W/m² (÷ 126.7) is created alongside it — matching the behavior already in place for WH68. (issue #198)
+
+## [1.7.9] - 2026-07-03
+
+### Changed
+- **Deterministic key ownership using Ecowitt's documented sensor priority order**: When multiple outdoor sensors share the same `common_list` keys (e.g. `0x02` temperature, `0x07` humidity, `0x03` dewpoint) and report equal signal strength, the integration now resolves ownership using Ecowitt's documented priority order — WN32/WH26 > WS90/WH90 > WS80/WH80 > WS69/WH69. A WN32 outdoor T/H sensor paired alongside a WH90/WS90 weather station will reliably own the shared temp/humidity/dewpoint keys rather than sharing them based on iteration order. A higher-priority sensor with signal=0 does not block an active lower-priority sensor (signal strength still beats priority). For sensors with equal priority, the previous poll's stable tie-break (issue #197) continues to apply. (issue #203)
+
+## [1.7.8] - 2026-07-01
+
+### Added
+- **WH90/WS90/WS85 hourly rain entity**: Added support for `0x7D` (Hourly Rain) from the `piezoRain` block. Ecowitt piezoelectric rain gauges report a one-hour rainfall accumulation at hex ID `0x7D`, positioned between rain rate (`0x0E`) and 24-hour rain (`0x7C`) in the response. This was a vendor-specific field not in the official spec, observed on GW2000A + WH90 firmware. (issue #205)
+
+## [1.7.7] - 2026-06-29
+
+### Added
+- **WN20 rain gauge support**: Added device detection for the WN20 ("Rain Mini", `type` 70) tipping-bucket rain gauge. It reports through the same `rain` block hex IDs (`0x0D`–`0x13`) as the WH40, so it now creates rain event/rate/daily/weekly/monthly/yearly entities plus a dedicated battery sensor (`wn20batt`), without renaming or otherwise affecting the existing `wh40batt` entity used by WH40 owners. (issue #202)
+
+## [1.7.6] - 2026-06-27
+
+### Fixed
+- **WH32/WN32 outdoor sensor data sporadic/unavailable when paired with a WH90/WS90**: When a WH32/WN32 outdoor temp/humidity sensor and a WH90/WS90 weather station are both present, they legitimately share the same common_list keys (`0x02` temperature, `0x07` humidity, `0x03` dewpoint) with equal signal strength. The gateway's `get_sensors_info` device order isn't guaranteed to stay the same between polls, so the previous tie-break (first-seen-in-this-poll wins) caused key ownership to flip between the two devices on every poll, leaving both entities with sporadic, single-point updates instead of continuous data. The mapper now remembers which hardware ID owned a key in the previous poll and keeps that owner stable on a tie, only switching when the previous owner's signal drops or it disappears entirely. (issue #197)
+
+## [1.7.5] - 2026-06-12
+
+### Fixed
+- **WH31 sensors with custom names not creating entities (GW3000A)**: When WH31 temperature/humidity sensors are renamed in the gateway web UI (e.g., "LivingRoom", "Office"), their `get_sensors_info` name no longer contains the "CH{n}" pattern that the integration used to extract the channel number. With no channel, no live-data keys were generated and no entities appeared despite `ch_aisle` data being present. The sensor mapper now falls back to the sensor `type` enum field (types 6–13 → channels 1–8 for WH31) when the name-based extraction returns nothing. The same fallback is applied to all other channel sensors (WH51, WH41, WH55, WH34, WH35, WH54). (issue #193)
+- **Spurious unit-change repair notifications for outdoor weather sensors**: When two sensors (e.g., an active WH90 and a stale WH65 slot) temporarily claimed the same live-data keys with equal signal strength, the `>=` comparison caused the mapping to flip between the two on consecutive polls. If the active sensor lost the race for one poll cycle, all its entities fell through to a loose hardware-ID-based fallback that returned the first hex sensor found for that device — which could be a rain entity (unit mm) instead of a humidity entity (unit %). Home Assistant then raised a unit-change repair. Two fixes combined: (1) the signal comparison is now `>` (strict), so the first-seen entry wins on a tie and the mapping stays stable; (2) the fallback in `get_sensor_data` now verifies that the sensor-type name derived from the stored sensor key (e.g., `outdoor_humidity` for `0x07`) appears in the requested entity ID before returning, preventing cross-sensor contamination. (issue #192)
+
+## [1.7.4] - 2026-05-31
+
+### Fixed
+- **Invalid entity ID for WH34 temperature channel sensors**: WH34 sensors (ch_temp block) generated entity IDs with a double underscore such as `sensor.ecowitt_tf__b0d0`. This happened because `_extract_sensor_type_from_key` stripped the channel suffix `ch` from the key `tf_ch` and returned `tf_` (trailing underscore), which then combined with the `_` separator before the hardware ID. The extraction now strips trailing underscores from the computed type name, producing valid entity IDs like `sensor.ecowitt_tf_b0d0`. Home Assistant was warning that double-underscore entity IDs will stop working in HA 2027.2.0. (issue #189)
+
+## [1.7.3] - 2026-05-30
+
+### Fixed
+- **WH65 no longer recognized after firmware update**: Some WH65 firmware versions report `img: "wh65"` instead of the usual `img: "wh69"`. The integration previously only matched `"wh69"`, so a WH65 on newer firmware would not create any entities. The sensor type detection now also accepts `"wh65"` as an alias for the WH69/WH65 outdoor sensor array. (issue #187)
+
+### Changed
+- **WH65 added to supported sensors list in README**: WH65 shares the WH69 integration path and was always functionally supported, but was not listed in the README. The table now shows **WH65 / WH69** to make this explicit.
+
+## [1.7.2] - 2026-05-21
+
+### Added
+- **WH54 diagnostic entities — Filter Level and Heater Counter**: Two new diagnostic entities are now exposed for WH54 liquid depth sensors using the `/get_cli_lds` configuration endpoint (API spec V1.0.4+). `Liquid Depth Filter Level CH{N}` reports the Data Filter Factor (an integer setting that controls sensor smoothing), and `Liquid Depth Heater Counter CH{N}` reports the cumulative heater activation count (`state_class: total_increasing`), useful for diagnosing WH54 operation in cold climates. These entities appear under the WH54 device alongside the existing air/depth/voltage entities. (issue #169)
+
+## [1.7.1] - 2026-05-11
+
+### Fixed
+- **WH45/WH46D PM2.5 concentration entities disappeared after v1.7.0**: The new `pm25_realaqi_co2` and `pm25_24haqi_co2` AQI keys added in v1.7.0 collapsed to the same generated entity_id as the pre-existing `pm25_co2` (PM2.5 concentration) and `pm25_24h_co2` (PM2.5 24h avg concentration) entities, because the substring `pm25` and `pm25_24h` in the type-mapping table matched both the concentration and AQI keys. The AQI entries were processed last and overwrote the concentration entries in the coordinator's per-entity_id dict, so the PM2.5 µg/m³ entities went unavailable on the WH45/WH46D device. Two new type-mapping entries (`pm25_24haqi` and `pm25_realaqi`) now run before the generic `pm25_24h` and `pm25` patterns so each PM2.5 co2 key gets a distinct sensor_type and entity_id. (issue #182)
+
+## [1.7.0] - 2026-05-10
+
+### Added
+- **Wind Chill (0x04) and Heat Index (0x05)**: Both `common_list` hex IDs are now exposed as temperature entities (°C) for all outdoor weather stations that emit them (WH69, WH90, WS90, WH80/WS80). These were silently dropped before because they had no `SENSOR_TYPES` entry or device key list. (issues #170, #171)
+- **UV Radiation (0x16)**: Raw UV irradiance in µW/m² is now a separate entity, distinct from the existing UV Index (0x17). Added to all outdoor weather stations that have a UV sensor. (issue #160)
+- **Total Rain (0x14)**: All-time cumulative rain total is now exposed for rain-capable devices (WH69, WH90, WS90, WH85, WH40). (issue #161)
+- **Indoor sensors via `common_list` (0x01, 0x06, 0x08, 0x09)**: Gateways running newer firmware may emit indoor temperature, indoor humidity, absolute pressure, and relative pressure via `common_list` hex IDs instead of (or in addition to) the `wh25` block. These IDs are now in the WH25 device key list and `SENSOR_TYPES` so they create proper entities when present. (issue #172)
+- **WH45/WH46D AQI index entities for co2 block**: All AQI index fields from the `co2` livedata block are now exposed — `PM25_RealAQI`, `PM25_24HAQI`, `PM10_RealAQI`, `PM10_24HAQI`, `PM1_RealAQI`, `PM1_24HAQI` (WH46D), `PM4_RealAQI`, `PM4_24HAQI` (WH46D) — each as a dimensionless `AQI` entity. Previously only raw concentrations (µg/m³) were exposed for the co2 block. (issue #163)
+- **Solar Illuminance (lx) entity for non-hex weather stations (WH68)**: The hex-based path (0x15 W/m²) already computed a `solar_lux` illuminance entity, but the string-key path (`solarradiation` W/m², used by WH68 and similar) did not. It now does the same calculation (W/m² × 126.7). (issue #180)
+
+### Fixed
+- **Solar Radiation shows in lx instead of W/m² (gateway in lux mode)**: When a WH68-type gateway is configured to output solar radiation in lux, the integration labelled the entity "Solar Radiation" with a lux unit — visually wrong. The entity is now renamed "Solar Illuminance" (lx, `illuminance` device class) and a derived "Solar Radiation" entity in W/m² (÷ 126.7) is also created alongside it. (issue #180)
+- **WH68 detection falls back to "Solar & Wind" firmware name**: If a gateway reports `img: ""` or a non-standard string for WH68, the official firmware name string `"Solar & Wind"` is now accepted as a detection fallback, matching the hardening pattern used for WH90. (issue #166)
+- **WH45 detection falls back to "PM25 & PM10 & CO2" firmware name**: Same hardening for WH45/WH46D — the official firmware name string `"PM25 & PM10 & CO2"` is now a valid detection fallback. (issue #167)
+
+### Changed
+- **0x0F Rain Gain intentionally omitted**: A comment has been added in `coordinator.py` near the rain block to document that `0x0F` (`ITEM_RAIN_GAIN`) is a calibration multiplier and is intentionally not exposed as a sensor entity. Use the gateway's web UI or the `get_rain_totals` endpoint to view or change the gain. (issue #168)
+
+## [1.6.21] - 2026-05-10
+
+### Fixed
+- **Orphan "4" and Vapor Pressure Deficit entities persisted on gateway after v1.6.20**: v1.6.20 routed common_list decimal IDs `"3"` (Feels Like) and `"5"` (VPD) to the outdoor weather station device and removed the spurious `"4"` sensor type that was never in the V1.0.6 spec. Entities created on the gateway device by earlier versions kept their old gateway-based unique_id and went "unavailable", because the new code creates entities under different unique_ids on the outdoor station. The integration now migrates `"3"` and `"5"` orphans to the active outdoor weather station (preserving history) and removes the orphan `"4"` entry on startup. Live-data processing also now skips unknown numeric sensor keys so a stray `"4"` from gateway firmware no longer re-creates an unnamed entity. (issue #178)
+
+## [1.6.20] - 2026-05-09
+
+### Added
+- **WH54 liquid depth sensor support**: WH54 channels (1–4) registered devices in Home Assistant but produced zero entities because the `ch_lds` livedata array was never parsed — the same phantom-device shape as the WH69 fix in v1.6.18/v1.6.19. The coordinator now reads `ch_lds`, mapping each channel's `air` → `lds_air_ch{N}` (mm), `depth` → `lds_depth_ch{N}` (mm), `voltage` → `lds_voltage_ch{N}` (V), and `battery` → `lds_batt{N}` (converted from the 0–5 scale to percentage). The WH54 device is now labelled "Liquid Depth Sensor" and treated as outdoor. (issue #164)
+- **PM2.5 AQI entities for WH41**: The `ch_pm25` block exposes both real-time and 24-hour AQI indices (`PM25_RealAQI`, `PM25_24HAQI`), but the integration previously dropped the real-time AQI entirely and misused the 24-hour AQI as a µg/m³ concentration on the `pm25_avg_24h_ch{N}` entity. Two new entities are now created per channel: `pm25_aqi_realtime_ch{N}` and `pm25_aqi_24h_ch{N}`, both with unit `AQI` (dimensionless 0–500). (issue #158)
+- **Feels Like Temperature and VPD now attach to outdoor weather stations**: The `"3"` (Feels Like) and `"5"` (VPD) decimal-string IDs in `common_list` had `SENSOR_TYPES` metadata but were never wired into a device's hex-ID list, so they registered as orphan entities on the gateway device. Both IDs are now part of the WH69, WH80/WS80, WH90, and WS90 key lists, and they attach to the outdoor sensor that calculates them. (issue #173)
+
+### Fixed
+- **WH51 soil moisture battery showed 0% for healthy sensors**: Per spec V1.0.6 §7, WH51 (`ch_soil`) battery uses the same binary encoding as WH31 (`ch_aisle`) — `0` = normal, `1` = low — but the `ch_soil` handler converted `"0"` to `0%` via the universal `*20` formula, making fully-charged sensors look dead. The handler now matches `ch_aisle`: `"0"` → 100%, `"1"` → 10%, and `"2"`–`"5"` continue to use the 0-5 bar `*20` conversion that some firmwares emit. (issue #174)
+- **PM25_24HAQI no longer misused as concentration**: Previously, when a gateway emitted only `PM25_24HAQI` (an AQI index, dimensionless 0–500), it was stored on the `pm25_avg_24h_ch{N}` entity with unit µg/m³ — visually conflating an AQI of 82 with a concentration of 82 µg/m³. `PM25_24HAQI` now populates the new `pm25_aqi_24h_ch{N}` AQI entity instead. The `pm25_avg_24h_ch{N}` concentration entity continues to be populated by the genuine concentration fields (`pm25_avg_24h`, `pm25_24h`) when emitted. (issue #158)
+
+### Changed
+- **Removed unused decimal-id `"4"` (Apparent Temperature) sensor type**: This `SENSOR_TYPES` entry was a developer error — `"4"` is not defined anywhere in the V1.0.6 spec (which uses `"3"` for Feels Like and `"5"` for VPD; `"0x04"` is Wind Chill, a separate hex ID). The dead entry has been removed along with its placeholder slot in `GATEWAY_SENSORS`. (issue #173)
+
+## [1.6.19] - 2026-05-02
+
+### Fixed
+- **Phantom WH69 device persisted after v1.6.18 fix**: v1.6.18 routed the shared `common_list` hex IDs to the active WH90 via signal-priority resolution, but the WH65 slot's device entry — pre-registered from `get_sensors_info` during integration setup — stayed in the device registry with zero entities and an unhelpful `wh69` model label. After platform setup, devices in the integration's config entry whose hardware ID is reported with `signal=0` and which have no entities are now removed; the gateway and any device with at least one entity are left alone, so freshly paired sensors awaiting their first live-data poll and disconnected sensors with cached entities are unaffected. (issue #155)
+
+## [1.6.18] - 2026-05-01
+
+### Fixed
+- **Phantom WH69 device showing WH90 entities after v1.6.17**: When a stale WH65/WH69 sensor slot from a previously paired weather station coexisted with an active WH90, both claimed the same `common_list` hex IDs (`0x02`, `0x07`, `0x0B`, `0x15`, `0x17`, `0x0D`–`0x13`). The dict-overwrite "last wins" picked an arbitrary owner depending on iteration order, splitting WH90's entities across two devices: a phantom WH69 with the temperature/humidity/wind/solar entities, and the real WH90 with only the rain entities. v1.6.17's multi-page `get_sensors_info` sweep made this newly visible because the stale WH65 slot lived on a higher page that the previous two-page sweep skipped. The mapper now prefers the entry with the stronger signal when two sensor types share live-data keys, so the active sensor wins and the stale slot stops claiming entities. (issue #155)
+
+## [1.6.17] - 2026-04-28
+
+### Fixed
+- **Sensors disappear after gateway firmware update (GW2000A V3.3.1, GW1100B V2.4.5+)**: Newer firmware moved paired sensors to higher pages of `/get_sensors_info` and advertises the page count via `sensorid_page` in `/get_version`. The integration was hardcoded to read only pages 1–2, so paired WH51 / WH34S / WH26 / WN32 sensors became unmapped — entities fell back to channel-based naming on the gateway device, and the `wh26batt` battery never appeared. The API client now reads `sensorid_page` from `/get_version` and iterates every advertised page (with a sane fallback to the legacy two-page sweep when the field is missing or invalid). Diagnosis and proposed fix by @briansperling. (issues #146, #148, #151)
+- **WH57 lightning timestamp displayed with a UTC offset**: `Last Lightning` interpreted the gateway's naive ISO-8601 timestamp as UTC, so users in non-UTC timezones saw the strike time skewed by their UTC offset (e.g. a 20:32 strike showed as 21:32 in CET). The gateway reports times in its local clock, which matches Home Assistant's configured timezone, so naive timestamps are now attached to HA's local timezone. (issue #153)
+
+## [1.6.16] - 2026-04-27
+
+### Fixed
+- **WH55 leak sensor logged Home Assistant warning about invalid unit**: After v1.6.15 added support for the WH55 leak channels, each entity logged `Entity sensor.ecowitt_leak_… is using native unit of measurement 'None' which is not a valid unit for the device class ('moisture')`. The leak sensor reports a binary `0`/`1` state, not a percentage, so the `moisture` device class (which requires `%`) was inappropriate. The device class has been removed; the entity still reports `0`/`1` and keeps its `mdi:water-alert` icon. (issue #149)
+
+## [1.6.15] - 2026-04-26
+
+### Fixed
+- **WH55 leak sensor created device but no entities**: Some gateways (e.g. GW1200B firmware 1.4.6) report WH55 leak channels only via the `ch_leak` array in `get_livedata_info` and never list them in `get_sensors_info`. Without an explicit handler the channels were silently ignored, so the wh55 device existed in Home Assistant but had zero entities. The coordinator now parses `ch_leak`, mapping each channel's `status` → `leak_ch{N}` (`0` = Normal, `1` = leak detected) and `battery` → `leakbatt{N}` (converted from the 0–5 scale to percentage). (issue #149)
+
+## [1.6.14] - 2026-04-20
+
+### Fixed
+- **Rain entities rounded to whole numbers**: Precipitation entities (rain event, rain rate, 24-hour/daily/weekly/monthly/yearly rain) had no `suggested_display_precision`, so Home Assistant displayed `0.2 mm` as `0 mm` and hid small rainfall totals that were visible in the Ecowitt app. mm-unit rain entities now display 1 decimal place and inch-unit rain entities display 2 decimal places. Underlying state values are unchanged. (issue #145)
+
+## [1.6.13] - 2026-04-07
+
+### Fixed
+- **WH35 leaf wetness sensor shows no values**: The `ch_leaf` array in `get_livedata_info` was not being processed, so leaf wetness and battery entities were created but always empty. The coordinator now reads `ch_leaf` and maps `humidity` → `leafwetness_ch{N}` and `battery` → `leaf_batt{N}` (converted from the 0–5 scale to percentage). (issue #141)
+
+## [1.6.12] - 2026-03-28
+
+### Fixed
+- **WH40 rain data attributed to WH90**: When both a tipping-bucket rain sensor (WH40 or WH69) and a piezoelectric rain sensor (WH90, WS90, or WS85) are registered simultaneously, they share the same rain hex IDs (`0x0D`–`0x13`), causing all rain entities to appear under whichever device registered last. Rain data from the `rain` array is now explicitly forced to the tipping-bucket device, and piezoRain data to the piezoelectric device, regardless of key registration order. (issue #137)
+
+## [1.6.11] - 2026-03-24
+
+### Fixed
+- **Invalid binary sensor entity ID**: The `srain_piezo` binary sensor (and any future binary sensors) had an invalid entity ID of the form `binary_sensor.sensor.ecowitt_…` due to a double domain prefix. This will become a hard failure in HA 2027.2.0. Entity IDs are now correctly formed as `binary_sensor.ecowitt_…`. (PR #135 by @Juror2372)
+
+## [1.6.10] - 2026-03-22
+
+### Fixed
+- **Duplicate "Unknown" gateway device after upgrade**: Users who upgraded from a version prior to v1.6.8 (where the gateway ID fallback was introduced) were left with a ghost device labelled "Unknown" alongside the correctly-named gateway device. On next startup the integration now automatically moves all entities from the stale "unknown" device to the real gateway device and removes the ghost. (issue #132)
+
+## [1.6.9] - 2026-03-22
+
+### Added
+- **Soil moisture AD (raw analog-to-digital) sensors**: `soilad1`–`soilad16` entities are now available for WH51/WH52 soil moisture sensors via the `/get_cli_soilad` endpoint. These are disabled by default and expose the raw ADC reading (typically ~70 for dry, ~500 for wet), enabling custom calibration curves in Home Assistant. (PR #130 by @elderapo)
+
+## [1.6.8] - 2026-03-19
+
+### Added
+- **WS85 wind & rain sensor support**: The WS85 (`wh85` image, "Wind & Rain") is now a fully supported device with wind, rain, battery percentage, battery voltage, and capacitor voltage entities. (issue #20)
+
+### Fixed
+- **WS90/WH90/WS85 voltage sensors now in Diagnostic section**: The battery voltage and capacitor voltage entities for WS90, WH90, and WS85 are now shown in the Diagnostic section alongside the battery percentage. Previously they appeared in the main Sensors section. (issue #119)
+- **WS90/WH90/WS85 voltage display precision**: Battery voltage now defaults to 2 decimal places; capacitor voltage defaults to 1 decimal place. (issue #119)
+- **WH80/WS80 battery entity missing**: The WH80/WS80 outdoor weather station battery level is now created from the sensors_info `batt` field. Previously it was only created if the gateway emitted `wh80batt` in livedata (which most firmware versions don't do). (issue #125)
+- **WN38 battery entity missing**: Same fix — WN38 battery is now created from sensors_info for firmware that doesn't emit it in livedata. (issue #113, #125)
+- **Gateway ID showing "unknown" for GW3000B**: Some gateways (GW3000B, and potentially others) don't include a `stationtype` field in `/get_version`. The gateway ID now falls back to the model name extracted from the firmware version string instead of "unknown". (issue #117)
+
+## [1.6.7] - 2026-03-18
+
+### Fixed
+- **Wind direction long-term statistics**: Added `state_class: measurement_angle` to wind direction sensors (`winddir`, `winddir_avg10m`) so Home Assistant can record them in long-term statistics correctly. (issue #126)
+- **Signal strength missing for single-channel sensors**: WH26, WH40, WH57, WH80, and WN38 sensors were not getting a Signal Strength diagnostic entity because the integration incorrectly required a channel number. Fixed so all paired sensors now show signal strength. (issues #122, #125)
+- **WH40 battery percentage wrong**: The WH40 rain gauge uses a 0–5 bar battery scale. The integration was treating it as binary (0/1) encoding, showing 10% when it should show 20–100%. Now correctly converts bar values to percentage (each bar = 20%). (issue #125)
+- **Decimal sensor IDs getting ugly entity names**: Sensors with decimal IDs like `3` (feels-like temperature) and `5` (VPD) were generating entity IDs like `sensor_ch3` instead of `feels_like_temp_…`. Fixed with explicit ID-to-name mapping. (issue #121)
+
+## [1.6.6] - 2026-03-15
+
+### Added
+- **WS90/WH90 capacitor and battery voltage sensors**: The WS90/WH90 reports a capacitor voltage (`ws90cap_volt`) and a precise battery voltage (`voltage`) alongside the existing battery percentage. Both are now exposed as sensor entities — `WS90 Capacitor Voltage` and `WS90 Battery Voltage` — allowing you to track capacitor charge level and exact battery voltage rather than just the 0–100% bar reading. (issue #119)
+
+## [1.6.5] - 2026-03-15
+
+### Fixed
+- **WH26/WN32 dew point entity missing**: Added dew point (`0x03`) to the WH26/WN32 sensor mapping so a Dewpoint Temperature entity is now created alongside temperature and humidity. (issue #104)
+- **WH26/WN32 battery entity missing**: The WH26/WN32 gateway firmware embeds the battery level inside the dew point (`0x03`) common_list item rather than sending a separate `wh26batt` key. The coordinator now extracts this embedded battery value and creates the battery entity. Uses binary encoding: `0` = 100% (full), non-`0` = 10% (low). (issue #104)
+- **Gateway device showing "Unknown" model**: Some gateways return the firmware version string with a `"Version: "` prefix (e.g. `"Version: GW1100A_V2.4.3"`), which broke the model name extraction. The extractor now searches for the `GW…` model name anywhere in the version string rather than assuming it starts at position 0. (issue #117)
+
+### Changed
+- Updated README to better explain the stable hardware-ID entity system as the primary motivation for this integration, and to include a comparison table with both the built-in HA Ecowitt integration and Ecowitt's official `ha-ecowitt-iot` integration.
+
+## [1.6.4] - 2026-03-14
+
+### Added
+- **WN38 Black Globe Thermometer support**: The WN38 now creates two sensor entities: Black Globe Temperature (`0xA1`) and WBGT — Wet Bulb Globe Temperature (`0xA2`). Both appear on the gateway device (current firmware reports no hardware ID for WN38). (issue #113)
+
+### Fixed
+- **WH26/WN32 outdoor T&H sensor entities missing**: The WH26/WN32 was incorrectly mapped to indoor sensor keys (`tempinf`, `humidityin`). Fixed to use the correct outdoor hex ID keys (`0x02`, `0x07`) so the sensor's hardware ID is linked to temperature and humidity entities and they appear under their own device. (issue #104)
+- **srain_piezo exposed as binary sensor**: The piezo rain state sensor (`srain_piezo`) is now created as a `moisture` binary sensor (on = raining, off = dry) instead of a numeric 0/1 sensor entity. (issue #110)
+
+## [1.6.3] - 2026-03-08
+
+### Added
+- **WH46D PM1.0 and PM4.0 sensor support**: The WH46D air quality sensor provides PM1.0 and PM4.0 readings in addition to PM2.5, PM10, CO2, temperature, and humidity. These values were present in the `co2` live data array but not processed. Four new entities are now created: PM1.0, PM1.0 24h Avg, PM4.0, and PM4.0 24h Avg. The WH46D is detected as `wh45` type by the gateway; the integration now handles both WH45 and WH46D from the same `co2` array — WH45 sensors simply won't have PM1/PM4 data so no extra entities appear. (issue #108)
+
+## [1.6.2] - 2026-03-06
+
+### Fixed
+- **WH52 soil temperature and conductivity entities appear on gateway instead of WH52 device**: The GW3000 gateway reports the WH52 as `wh51` in `get_sensors_info`, so the hardware ID mapping only included `soilmoisture` and `soilbatt` keys for WH51. The `soiltemp` and `soilec` keys from the `ch_ec` live data array had no hardware ID mapping and fell through to the gateway device. Fixed by including `soiltemp{ch}` and `soilec{ch}` in the WH51 key list — if the connected sensor is a real WH51 (no EC data), these extra keys simply won't exist in live data and no extra entities are created. (issue #103)
+
+## [1.6.1] - 2026-03-06
+
+### Fixed
+- **Unconnected sensor slots pollute hardware mapping**: The gateway's `get_sensors_info` page 2 lists all possible sensor channel slots, including unconnected ones with placeholder hardware IDs (`FFFFFFFF` / `FFFFFFFE`). These were previously processed and added to the mapping, potentially overwriting valid hardware IDs for connected sensors (e.g. WH51 CH1 with real ID `4108` could be shadowed by CH2–16 all mapped to `FFFFFFFF`). Placeholder IDs are now filtered out during sensor mapping, ensuring only physically connected sensors appear as devices.
+
+## [1.6.0] - 2026-03-06
+
+### Added
+- **WH52 soil sensor support**: The WH52 (enhanced soil sensor with electrical conductivity) now creates entities for soil moisture, soil temperature, and soil electrical conductivity (EC in µS/cm) from the `ch_ec` data array. Battery is mapped using the same 0–5 bar scale as WH51. (issue #103)
+
+## [1.5.36] - 2026-03-01
+
+### Fixed
+- **WH45 air quality sensor creates no entities**: The WH45 (CO2 + PM2.5 + PM10 + temperature/humidity combo sensor) was completely missing from the local polling integration. The gateway returns its data in a `co2` JSON array, which was never processed. The coordinator now extracts all WH45 readings from the `co2` array and maps them to the expected sensor keys (`pm25_co2`, `pm10_co2`, `co2`, `co2_24h`, `humi_co2`, `tf_co2`/`tf_co2c`, and battery). Battery level 6 (DC power) is correctly capped at 100%. (issue #96)
+
+## [1.5.35] - 2026-02-28
+
+### Fixed
+- **WH69 rain sensor battery linked to wrong device**: When a WH69 weather station is used as the rain sensor, its battery entity was being assigned to the WH40 rain gauge device instead of the WH69 device. The integration now detects whether a WH69 is registered and uses the correct `wh69batt` key (linking battery to the WH69 device) rather than always defaulting to `wh40batt`. This is the same device-aware battery association pattern used for WS90/WH90 battery in v1.5.32.
+
+## [1.5.34] - 2026-02-28
+
+### Fixed
+- **WH40/WH69 rain sensor battery shows 0% when battery is new**: The `0x13` (Yearly Rain) item in the `rain` array carries the rain sensor's battery level. The integration was treating it as a 0–5 scale (`× 20`), causing a new battery to show 0%. Confirmed by @mjb1416 (GW1200A + WH69, issue #95): `"battery": "0"` with a new battery. The encoding is binary — `"0"` = full (100%), `"1"` = low (10%) — matching the same encoding already used for the `ch_aisle` battery (fixed in v1.5.28). Updated to use correct binary conversion.
+
+## [1.5.33] - 2026-02-28
+
+### Fixed
+- **`0x10` rain entity mislabeled as "Hourly Rain" (is Daily Rain)**: The `0x10` hex ID in Ecowitt's local API contains a midnight-reset **daily** rain total, not hourly rain. The integration was displaying it as "Hourly Rain" since v1.5.21. User @nmaster2042 confirmed this via history chart (value accumulates all day, resets at midnight) and comparison with the Ecowitt app (HA showed 7mm, Ecowitt "Hourly" showed 1.1mm, "Daily" showed 7mm). The Ecowitt app's "Hourly" value is not available in the local polling API. Fixed by renaming `0x10` to "Daily Rain" throughout. **⚠️ Breaking change:** Entity ID changes from `sensor.ecowitt_hourly_rain_XXXX` → `sensor.ecowitt_daily_rain_XXXX` — update any automations or dashboards referencing `hourly_rain`.
+
+## [1.5.32] - 2026-02-26
+
+### Fixed
+- **WS90 battery entity appears under Gateway instead of WS90 device**: The `piezoRain` battery extraction always used the key `wh90batt`, so WS90 users' battery entity was assigned no hardware ID and fell to the gateway device. Fixed by checking which battery key (`ws90batt` or `wh90batt`) is registered in the sensor mapper and using the correct one. WH90 users are unaffected.
+
+## [1.5.31] - 2026-02-26
+
+### Fixed
+- **WH57 Lightning Strikes and Last Lightning entities missing**: All three lightning sensor keys (`lightning_num`, `lightning_time`, `lightning`) were generating the same entity ID (`sensor.ecowitt_lightning_*`) due to a substring collision in the entity ID generator. The coordinator added all three to its sensor list but only the distance entity survived — strikes and timestamp were silently overwritten. Fixed by adding specific patterns for `lightning_num` (`lightning_strikes`) and `lightning_time` (`last_lightning`) before the generic `lightning` pattern. The distance entity ID is unchanged (`sensor.ecowitt_lightning_*`). Reported by @chrisgillings in issue #19.
+- **WH57 Last Lightning timestamp invalid in HA**: The gateway returns the last-strike datetime as a naive ISO 8601 string (`"2026-02-22T18:00:36"`) without timezone info. Home Assistant's `timestamp` device class requires a timezone-aware `datetime` object. Fixed by converting the string to a UTC-aware `datetime` in sensor entity setup.
+
+## [1.5.30] - 2026-02-25
+
+### Fixed
+- **WH90 battery shown as 5% in Battery State Card**: The raw battery bar value (0–5 scale from the gateway's `get_sensors_info` API) was being spread into the attributes of every entity on a device, including non-battery entities. Battery State Card reads the `battery_level` attribute and interpreted the raw bar value (e.g. `5`) as 5%, showing a nearly-dead battery for a fully charged WH90. Fixed by removing the raw `battery` field from shared sensor details and instead setting `battery_level` only on dedicated battery entities, sourced from the entity's own state (which is already correctly converted to a percentage). Closes issue #90.
+
+## [1.5.29] - 2026-02-24
+
+### Added
+- **Solar Illuminance (lux) entity**: Added a computed `sensor.ecowitt_solar_lux_*` entity alongside the existing solar radiation (`0x15`) entity. The gateway's local API always returns solar radiation in W/m² regardless of the unit setting in the gateway web UI, so illuminance is computed as `lux = W/m² × 126.7`. The entity uses device class `illuminance` and unit `lx`. Users who had their gateway set to "Lux" mode (which was already handled by the Klux conversion) will now also see this computed entity — both show the same value in that case. Closes issue #84.
+
+## [1.5.28] - 2026-02-24
+
+### Fixed
+- **WH57 (lightning sensor) has no entities**: The coordinator was completely ignoring the `lightning` block in the gateway API response. Fixed by adding dedicated processing that extracts lightning distance, strike count, last-strike timestamp, and battery level from the `lightning` array and maps them to the WH57 device. Reported by @chrisgillings in issue #19.
+- **WH40 (rain gauge) has no entities**: The sensor mapper was using plain metric key names (`rainratein`, `eventrainin`, etc.) which don't match what the gateway API actually sends — the `rain` array uses hex IDs (`0x0E`, `0x0D`, `0x7C`, `0x10`, `0x11`, `0x12`, `0x13`). Fixed by updating WH40 to use the correct hex ID keys. Reported by @chrisgillings in issue #19.
+- **WH40 battery not shown**: The battery level embedded in the `0x13` (yearly rain) item of the `rain` array was silently discarded. Fixed by extracting it and creating the `wh40batt` entity.
+
+## [1.5.27] - 2026-02-23
+
+### Fixed
+- **Unknown content-type JSON parsing**: Gateways that return JSON with an unrecognised `Content-Type` header (e.g. `application/octet-stream`) could silently fail. Fixed by passing `content_type=None` to skip the content-type check when the type is not `application/json`, `text/html`, or `text/plain`.
+- **Leafwetness channel key duplication in const.py**: Removed a duplicate `elif base_key == "leafwetness_ch"` branch that was shadowed by the earlier `if "_ch" in base_key` check. No user-visible behaviour change.
+
+### Changed
+- **Test coverage raised to 100%**: Added targeted tests for all previously uncovered edge-case code paths (retry-after-401 success path, GW-prefix firmware model regex, migration hardware-id fallback from coordinator data, and reload-entry success path).
+- **Updated codecov badge URL** in README to use the stable token-based link.
+
+## [1.5.26] - 2026-02-23
+
+### Fixed
+- **WH31/WH69 battery always shows 0% even when battery is OK**: WH31 and WH69 sensors report battery as a binary flag — `0` means OK, `1` means weak — not a 0–5 bar scale. The previous code applied `value × 20` (designed for WH51 soil sensors), which mapped `0` → 0% and `1` → 20%. Both values were wrong. Fixed: binary `0` now displays 100% (OK) and binary `1` displays 10% (weak). Reported by @AnHardt in issue #19.
+- **0x7C rain entity mislabeled "Daily Rain"**: The `0x7C` hex ID contains a rolling 24-hour rain total (not a midnight-reset calendar daily total). It was labeled "Daily Rain" which caused confusion when the value did not reset at midnight. Renamed to "24-Hour Rain". Entity IDs change from `sensor.ecowitt_daily_rain_XXXX` to `sensor.ecowitt_24h_rain_XXXX` — users with automations referencing the old entity ID will need to update them. Confirmed by @nmaster2042 in issue #5.
+
+### Changed
+- **⚠️ Breaking: `sensor.ecowitt_daily_rain_XXXX` entity renamed to `sensor.ecowitt_24h_rain_XXXX`**: If you have automations, scripts, or dashboards referencing `daily_rain` in the entity ID, update them to use `24h_rain` instead.
+
+## [1.5.25] - 2026-02-22
+
+### Fixed
+- **WH31/WH34 temperature still wrong on GW3000A and GW1200C**: The v1.5.14 fix for Celsius temperature double-conversion was not working on newer gateway firmware. Newer firmware (GW3000A, GW1200C) returns the temperature unit setting under the key `"temperature"` in `/get_units_info`, while older firmware uses `"temp"`. The coordinator was only checking `"temp"`, so on newer gateways it silently fell back to assuming Fahrenheit and the double-conversion persisted. Fixed by checking `"temperature"` first and falling back to `"temp"`. Fixes issue #19.
+
+## [1.5.24] - 2026-02-22
+
+### Fixed
+- **Signal strength entity causes HA validation error**: Signal strength sensors (reporting 0–100% converted from the gateway's 0–4 bar scale) were incorrectly using `device_class: signal_strength`, which Home Assistant requires to be in dB or dBm. This caused a log error on every HA startup: *"is using native unit of measurement '%' which is not a valid unit for the device class ('signal_strength')"*. Removed the device class; the sensor now reports a plain percentage with no device class, which is valid and suppresses the error. Reported by @mlohus93 in issue #13.
+
+## [1.5.23] - 2026-02-22
+
+### Fixed
+- **WS90/WH90 sensors freeze after startup — wind, UV, radiation, rain stuck at initial value**: When the integration was updated in a prior version, entity IDs for hex-sensor types were renamed (e.g. `sensor.ecowitt_0x0b_4094a8` → `sensor.ecowitt_wind_speed_4094a8`). Home Assistant kept the old entity IDs in the entity registry for existing installations. On each coordinator refresh, the data lookup failed to find the old entity_id in the new-format sensor dict; the broken fallback then returned the wrong sensor's data (always outdoor temperature). Home Assistant rejected the resulting device-class/unit mismatch and left the entity frozen at its startup value. Fixed by switching the primary lookup to `sensor_key + hardware_id`, which is stable across entity_id format changes. All sensors now update on every coordinator refresh regardless of which entity_id format is stored in the registry. Reported by @nmaster2042 in issue #5.
+- **WH90 battery entity appears under gateway device instead of WH90 device**: The battery value extracted from `piezoRain` was stored with key `ws90batt`, but the sensor mapper registered `wh90batt` for WH90. The key mismatch caused the battery entity to have no hardware ID and appear under the gateway device. Changed coordinator to use `wh90batt` to match the sensor mapper, so the battery is now correctly associated with the WH90 device.
+- **Apparent temperature (sensor "4") appears with wrong name and no device class**: GW2000/GW3000 gateways report apparent temperature as common_list id `"4"` alongside outdoor sensors. This key was missing from `GATEWAY_SENSORS` and `SENSOR_TYPES`, so it appeared as an unnamed sensor with entity_id `sensor.ecowitt_sensor_ch4`. Added proper definition: "Apparent Temperature", device class temperature, state class measurement.
+
+## [1.5.22] - 2026-02-21
+
+### Fixed
+- **WH41 PM2.5 air quality sensor has no entities**: The `ch_pm25` data section returned by Ecowitt gateways (GW3000, GW2000, etc.) was never processed by the coordinator, so WH41 sensors would appear as a device with zero entities. The coordinator now reads `ch_pm25` and creates `pm25_ch{N}` (real-time PM2.5), `pm25_avg_24h_ch{N}` (24-hour average), and `pm25batt{N}` (battery) entities for each channel. Both `"pm25"` (lowercase) and `"PM25"` / `"PM25_24HAQI"` (uppercase) field name variants from different firmware versions are handled. Fixes issue #68.
+- **PM2.5 24h average entity_id collision with real-time entity**: The sensor type extractor was returning `pm25` for both `pm25_ch1` and `pm25_avg_24h_ch1`, causing both entities to share the entity_id `sensor.ecowitt_pm25_*` and overwrite each other. The 24h average now generates a distinct `sensor.ecowitt_pm25_24h_avg_*` entity_id.
+
+## [1.5.21] - 2026-02-20
+
+### Fixed
+- **Rain sensor labels wrong for WS90/WH90 (off by one step)**: The hex ID names for piezoRain sensors were shifted: `0x10` was labelled "Weekly Rain" when it is actually "Hourly Rain"; `0x11` was "Monthly" (actually Weekly); `0x12` was "Yearly" (actually Monthly); `0x13` was "Total" (actually Yearly). Corrected all four names and their entity ID slugs (`hourly_rain`, `weekly_rain`, `monthly_rain`, `yearly_rain`). Reported by @nmaster2042 in issue #5. **Note:** entity IDs for these four sensors will change after update (e.g. `sensor.ecowitt_weekly_rain_XXXX` → `sensor.ecowitt_hourly_rain_XXXX`). Please update any automations or dashboard cards that reference them.
+
+## [1.5.20] - 2026-02-19
+
+### Fixed
+- **Solar radiation entity unavailable when gateway reports Klux instead of W/m²**: Ecowitt gateways allow solar radiation units to be configured as Lux (instead of the default W/m²). When set to Lux, the gateway reports values like `"42.5 Klux"`. The coordinator passed this unit through unchanged, which caused Home Assistant to reject the entity because `"Klux"` is incompatible with the `irradiance` device class. The coordinator now converts Klux → lx (×1000) and overrides the device class to `illuminance` to match the reported unit. `"Lux"` values (without the kilo prefix) are also normalised to `"lx"`. Fixes issue #44 (GW2000A + WH80 with metric solar unit setting).
+
+## [1.5.19] - 2026-02-19
+
+### Fixed
+- **Indoor temperature showing ~160°F instead of ~74°F (wh25 unit ignored)**: The `wh25` indoor sensor block includes a `"unit"` field (`"F"` or `"C"`) that was being silently discarded. Without it, the entity fell back to the `SENSOR_TYPES` default unit (`°C`), so a Fahrenheit gateway value like `74.1` was displayed as `74.1°C` (~165°F). The gateway's `"unit"` field is now passed through and used as the entity's native unit. Fixes the temperature reported by @darrendavid in issue #40.
+
+## [1.5.18] - 2026-02-19
+
+### Fixed
+- **WH69 sensors unavailable on GW3000 (knots wind speed, W/m² solar radiation)**: WH69 sensors connected via GW3000 report wind speed and gust as `"0.00 knots"` and solar radiation as `"612.67 W/m2"`. The unit normalizer did not recognise `"knots"` as a valid unit string, leaving those sensors unavailable. Added `"knots"` → `"kn"` mapping (the correct HA unit for knots wind speed). The `"W/m2"` → `"W/m²"` mapping was already present and working. Fixes issue #41.
+
+## [1.5.17] - 2026-02-19
+
+### Fixed
+- **Password authentication fails (GW2000, GW3000)**: Any non-empty gateway password caused the integration to fail with a connection error. The root cause: Ecowitt local data endpoints (`/get_livedata_info`, `/get_sensors_info`, `/get_version`, `/get_units_info`) require no authentication — the gateway exposes them openly regardless of the password setting. The integration was pre-emptively calling `/set_login_info` before every data request, which returns HTTP 500 on real hardware and aborts the request before any data is fetched. Removed the pre-emptive authentication calls; the data endpoints are now called directly. The `authenticate()` method is retained for future use. Fixes issue #43.
+
+## [1.5.16] - 2026-02-19
+
+### Fixed
+- **Rain sensors missing for tipping-bucket rain gauges (GW1200, GW2000A with WS69/WH69)**: Some gateways place tipping-bucket rain sensor data in a top-level `"rain"` JSON array instead of `common_list`. The coordinator was not processing this array, so all rain entities (rain rate, event rain, daily/weekly/monthly/yearly/total rain) were never created. The `"rain"` array is now processed alongside `common_list`, `piezoRain`, and other data sections. Fixes issue #59; also resolves the rain-entity-missing portion of issue #11 (WH69 with GW2000A).
+
+## [1.5.15] - 2026-02-18
+
+### Fixed
+- **WS80/WH80 wind sensors unavailable**: Wind sensors (wind speed, gust, direction, direction avg) connected via GW3000 + WS80 now receive live updates. The WH80/WS80 device type was missing from the hardware ID mapper, causing all wind hex-ID sensors (0x0A, 0x0B, 0x0C, 0x6D) to return `None` hardware_id and create malformed fallback entity IDs. Fixes issue #23.
+- **WH34 temperature probe — no entities**: WH34 wired temperature sensors now create entities. The coordinator was silently ignoring the `ch_temp` data array that WH34 uses, so despite the device appearing in HA no temperature or battery entities were ever created. The coordinator now processes `ch_temp` the same way as `ch_aisle` (WH31), respecting the gateway's configured unit (°C/°F). Fixes issue #16.
+- **WH34/tf_ch sensor name**: Renamed "Soil Temperature CH{n}" to "Temperature CH{n}" — WH34 is a general-purpose wired temperature probe, not a soil sensor. This is not a breaking change as no WH34 users had working entities before this release.
+- **ConfigEntryNotReady raised in wrong place**: Moved `async_config_entry_first_refresh()` from the sensor/binary_sensor platform setup to `__init__.py` before `async_forward_entry_setups`. HA requires this to be raised before forwarding platforms; the previous placement caused log warnings on every startup.
+
+## [1.5.14] - 2026-02-18
+
+### Fixed
+- **WH31/ch_aisle temperature double-conversion for Celsius gateways**: Ecowitt firmware always reports `"unit": "F"` in `ch_aisle` data even when the gateway is configured in Celsius mode, causing HA to apply an erroneous °F→°C conversion to values that are already in Celsius (e.g. 22.2°C displayed as −5.5°C). The coordinator now fetches the gateway's actual unit setting from `/get_units_info` and uses it when processing `ch_aisle` temperature sensors. Fixes issues #19, #13.
+
+## [1.5.13] - 2026-02-18
+
+### Fixed
+- **Rain sensor state_class missing**: Rain entities now correctly expose `state_class` (`measurement` for rain rate, `total` for event rain, `total_increasing` for accumulated rain). Previously all `precipitation` device-class sensors were forced to `measurement`, causing HA long-term statistics warnings after HA 2025.12. Fixes issues #32, #45.
+
+## [1.5.12] - 2026-02-18
+
+### Fixed
+- **Options flow values not saved**: After editing options (scan interval, mapping interval, include inactive), reopening the options form now shows the previously saved values instead of reverting to the original setup values. Fixes issues #50, #31.
+
+## [1.5.11] - 2026-02-18
+
+### Fixed
+- **HA 2026.x compatibility**: Update deprecated `hass.helpers.entity_registry` API calls to use `homeassistant.helpers.entity_registry` module directly
+- **HA 2026.x compatibility**: Replace direct `config_entry.minor_version` assignment (now read-only) with `hass.config_entries.async_update_entry()`
+- **HA 2026.x compatibility**: Remove `config_entry` parameter from `OptionsFlowHandler.__init__` (base class now provides it automatically)
+
+## [1.5.10] - 2026-02-18
+
+### Fixed
+- **Inactive sensor filtering**: Also exclude sensors with IDs `FFFFFFFE` and `00000000` (not only `FFFFFFFF`) to correctly filter all unconnected sensors (contributed by @rvecchiato, fixes #48)
+- **Entity ID casing**: Normalize sensor type names to lowercase for consistent entity ID generation
+
+## [1.5.8] - 2025-11-13
+
+### Documentation
+- **HACS Integration**: Added comprehensive documentation about HACS tag requirements
+  - Detailed explanation of how HACS detects releases via git tags
+  - Tag format requirements (vX.Y.Z) with examples
+  - Verification steps for validating HACS integration
+  - Complete workflow descriptions for all three automation workflows
+
+### Changed
+- **Release Documentation**: Enhanced CLAUDE.md with explicit HACS tagging process
+  - Documents that auto-release.yml creates annotated git tags automatically
+  - Clarifies that tags are CRITICAL for HACS to detect new versions
+  - Added verification commands for post-release validation
+
+## [1.5.7] - 2025-11-13
+
+### Fixed
+- **CHANGELOG Extraction**: Fixed auto-release workflow to properly extract release notes from CHANGELOG.md
+  - Improved awk pattern matching for version sections
+  - GitHub releases now include full CHANGELOG content instead of generic message
+
+### Changed
+- **Testing**: Full automation test with end-to-end workflow validation
+
+## [1.5.6] - 2025-11-13
+
+### Added
+- **Automated Release Process**: Complete GitHub Actions automation for releases
+  - Auto-PR creation when pushing to `claude/**` branches with version bumps
+  - Auto-merge after all CI checks pass
+  - Auto-release creation with git tags and GitHub releases
+  - Version change detection to prevent unnecessary release PRs
+- **Release Documentation**: Comprehensive documentation in CLAUDE.md and .github/workflows/README.md
+- **README Update**: Added Automated Releases section in Contributing guide
+
+### Technical Details
+- Three new GitHub Actions workflows: auto-pr.yml, auto-merge.yml, auto-release.yml
+- Smart version detection compares branch version with main to trigger releases
+- CHANGELOG-based release notes extraction
+- Proper check name matching for CI validation
+
+## [1.5.5] - 2025-11-13
+
+### Fixed
+- **Home Assistant 2025.11 Compatibility**: Fixed `services.yaml` validation error by removing device filters from target selectors
+  - Home Assistant 2025.11 introduced a breaking change that removed support for device filters in target selectors
+  - Updated service definitions to use simplified target format without device filters
+  - Service handlers in Python already validate device membership, so no functionality is lost
+  - Fixes hassfest validation error: "Services do not support device filters on target, use a device selector instead"
+
+### Technical Details
+- Simplified `refresh_mapping` and `update_data` service target selectors to basic format
+- Removed deprecated device filter syntax that was causing CI failures
+- All GitHub Actions tests now passing (CI, hassfest, HACS validation)
+
+## [1.5.4] - 2025-10-07
+
+### Fixed
+- Enhanced piezoRain test with flexible battery value validation
+
+## [1.5.3] - Previous Release
+
+See [GitHub Releases](https://github.com/alexlenk/ecowitt_local/releases) for earlier versions.
+
+---
+
+## Version History
+
+- **1.5.7** - CHANGELOG extraction fix and automation testing
+- **1.5.6** - Automated release process
+- **1.5.5** - Home Assistant 2025.11 compatibility fix
+- **1.5.4** - Test improvements
+- **1.5.3** - Bug fixes
+- **1.5.2** - Bug fixes
+- **1.5.1** - Bug fixes
+- **1.5.0** - Feature release
+- **1.4.9** - Bug fixes
+- **1.4.8** - WH90 support
+
+For detailed information about each release, visit the [Releases page](https://github.com/alexlenk/ecowitt_local/releases).

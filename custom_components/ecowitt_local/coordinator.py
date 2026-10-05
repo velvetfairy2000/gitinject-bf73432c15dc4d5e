@@ -1,0 +1,1897 @@
+"""Data update coordinator for Ecowitt Local integration."""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import re
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional
+
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import CONF_HOST, CONF_PASSWORD
+from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
+from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
+
+from .api import (
+    AuthenticationError,
+)
+from .api import ConnectionError as APIConnectionError
+from .api import EcowittLocalAPI
+from .const import (
+    BATTERY_SENSORS,
+    BINARY_SENSORS,
+    CONF_INCLUDE_INACTIVE,
+    CONF_MAPPING_INTERVAL,
+    CONF_SCAN_INTERVAL,
+    DEFAULT_MAPPING_INTERVAL,
+    DEFAULT_SCAN_INTERVAL,
+    DOMAIN,
+    GATEWAY_SENSORS,
+    SENSOR_TYPES,
+    SYSTEM_SENSORS,
+)
+from .sensor_mapper import SensorMapper
+
+_LOGGER = logging.getLogger(__name__)
+
+
+def extract_model_from_firmware(firmware_version: str) -> str:
+    """Extract gateway model from firmware version string.
+
+    Args:
+        firmware_version: Firmware version string (e.g., "GW1100A_V2.4.3")
+
+    Returns:
+        Gateway model (e.g., "GW1100A") or "Unknown" if extraction fails
+    """
+    if not firmware_version or firmware_version == "Unknown":
+        return "Unknown"
+
+    try:
+        # Some gateways prepend "Version: " to the version string (e.g. "Version: GW1100A_V2.4.3")
+        # Search for the GW model anywhere in the string to handle these cases.
+        # The model name ends at the first delimiter: underscore, dot, whitespace, or end of string.
+        match = re.search(r"\b(GW\w+?)(?=[_.\s]|$)", firmware_version)
+        if match:
+            return match.group(1)
+
+    except Exception as err:  # pragma: no cover
+        _LOGGER.debug(
+            "Error extracting model from firmware version '%s': %s",
+            firmware_version,
+            err,
+        )
+
+    return "Unknown"
+
+
+class EcowittLocalDataUpdateCoordinator(DataUpdateCoordinator[Dict[str, Any]]):
+    """Data coordinator for Ecowitt Local."""
+
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        config_entry: ConfigEntry,
+    ) -> None:
+        """Initialize coordinator."""
+        self.config_entry = config_entry
+        self.api = EcowittLocalAPI(
+            host=config_entry.data[CONF_HOST],
+            password=config_entry.data.get(CONF_PASSWORD, ""),
+        )
+        self.sensor_mapper = SensorMapper()
+        self._gateway_info: Dict[str, Any] = {}
+        self._last_mapping_update: Optional[datetime] = None
+        self._include_inactive = config_entry.data.get(CONF_INCLUDE_INACTIVE, False)
+        self._gateway_temp_unit: str = (
+            "°F"  # default; overridden by get_units_info ("0"=°C, "1"=°F)
+        )
+
+        # Get update intervals
+        scan_interval = config_entry.data.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL)
+
+        super().__init__(
+            hass,
+            _LOGGER,
+            name=DOMAIN,
+            update_interval=timedelta(seconds=scan_interval),
+        )
+
+    async def _async_update_data(self) -> Dict[str, Any]:
+        """Fetch data from Ecowitt gateway."""
+        try:
+            # Update sensor mapping if needed
+            await self._update_sensor_mapping_if_needed()
+
+            # Get live data
+            live_data = await self.api.get_live_data()
+            _LOGGER.debug(
+                "Raw live data keys: %s",
+                list(live_data.keys()) if live_data else "None",
+            )
+            if live_data.get("common_list"):
+                _LOGGER.debug(
+                    "Found %d items in common_list", len(live_data["common_list"])
+                )
+                for item in live_data["common_list"]:
+                    _LOGGER.debug(
+                        "Sensor item: id=%s, val=%s", item.get("id"), item.get("val")
+                    )
+            else:
+                _LOGGER.debug("No common_list found in live data")
+
+            # Also check other data structures
+            for key in live_data.keys():
+                if key != "common_list":
+                    _LOGGER.debug("Additional data key '%s': %s", key, live_data[key])
+
+            # Process the data
+            processed_data = await self._process_live_data(live_data)
+
+            return processed_data
+
+        except AuthenticationError as err:
+            raise ConfigEntryAuthFailed(f"Authentication failed: {err}") from err
+        except APIConnectionError as err:
+            raise UpdateFailed(f"Error communicating with gateway: {err}") from err
+        except Exception as err:
+            _LOGGER.exception("Unexpected error fetching data")
+            raise UpdateFailed(f"Unexpected error: {err}") from err
+
+    async def _update_sensor_mapping_if_needed(self) -> None:
+        """Update sensor mapping if enough time has passed."""
+        mapping_interval = self.config_entry.data.get(
+            CONF_MAPPING_INTERVAL, DEFAULT_MAPPING_INTERVAL
+        )
+
+        now = datetime.now()
+        if (
+            self._last_mapping_update is None
+            or (now - self._last_mapping_update).total_seconds() >= mapping_interval
+        ):
+            _LOGGER.debug(
+                "Triggering sensor mapping update (last_update=%s, interval=%s)",
+                self._last_mapping_update,
+                mapping_interval,
+            )
+            await self._update_sensor_mapping()
+            self._last_mapping_update = now
+        else:
+            _LOGGER.debug(
+                "Skipping sensor mapping update (last_update=%s, interval=%s)",
+                self._last_mapping_update,
+                mapping_interval,
+            )
+
+    async def _update_sensor_mapping(self) -> None:
+        """Update sensor hardware ID mapping."""
+        try:
+            _LOGGER.debug("Updating sensor mapping")
+
+            # Fetch gateway unit settings (temp: "0"=Celsius, "1"=Fahrenheit)
+            # Newer firmware (GW3000A, GW1200C) uses key "temperature"; older uses "temp".
+            try:
+                units_data = await self.api.get_units()
+                temp_unit_code = units_data.get(
+                    "temperature", units_data.get("temp", "1")
+                )
+                self._gateway_temp_unit = "°C" if temp_unit_code == "0" else "°F"
+                _LOGGER.debug(
+                    "Gateway temperature unit: %s (code=%s)",
+                    self._gateway_temp_unit,
+                    temp_unit_code,
+                )
+            except Exception as err:
+                _LOGGER.warning(
+                    "Could not fetch gateway unit settings, assuming °F: %s", err
+                )
+
+            # Get sensor mappings from both pages
+            sensor_mappings = await self.api.get_all_sensor_mappings()
+            _LOGGER.debug("Retrieved %d sensor mappings from API", len(sensor_mappings))
+            if not sensor_mappings:
+                _LOGGER.warning(
+                    "No sensor mappings returned from API - this will cause all sensors to appear on gateway device"
+                )
+            for mapping in sensor_mappings:
+                _LOGGER.debug("Sensor mapping: %s", mapping)
+
+            # Update the mapper
+            self.sensor_mapper.update_mapping(sensor_mappings)
+
+            stats = self.sensor_mapper.get_mapping_stats()
+            _LOGGER.info(
+                "Updated sensor mapping: %d sensors, %d mapped keys, %d sensor types",
+                stats["total_sensors"],
+                stats["mapped_keys"],
+                stats["sensor_types"],
+            )
+
+        except Exception as err:
+            _LOGGER.warning("Failed to update sensor mapping: %s", err)
+
+    async def _process_live_data(self, raw_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Process raw live data into structured sensor data."""
+        sensors_data: Dict[str, Any] = {}
+        processed_data: Dict[str, Any] = {
+            "sensors": sensors_data,
+            "gateway_info": {},
+            "last_update": datetime.now(),
+        }
+
+        # Process all sensor data sources
+        all_sensor_items = []
+
+        # Extract common_list data (main sensor readings)
+        common_list = raw_data.get("common_list", [])
+        all_sensor_items.extend(common_list)
+        # WH26/WN32 embeds battery in the 0x03 (dewpoint) common_list item.
+        # Binary encoding: "0" = full (100%), non-"0" = low (10%).
+        for item in common_list:
+            if item.get("id") == "0x03" and item.get("battery") is not None:
+                if self.sensor_mapper.get_hardware_id("wh26batt") is not None:
+                    battery_pct = "100" if item["battery"] == "0" else "10"
+                    all_sensor_items.append({"id": "wh26batt", "val": battery_pct})
+                    _LOGGER.debug(
+                        "Added WH26 battery from 0x03: wh26batt = %s%%", battery_pct
+                    )
+
+        # Extract rain data (tipping-bucket rain sensor — WH40, GW1200, GW2000A with WH69)
+        # Note: 0x0F (ITEM_RAIN_GAIN) is a calibration multiplier, not a live measurement.
+        # It is intentionally not exposed as a sensor entity. Use the gateway's web UI or
+        # the get_rain_totals endpoint (spec §9) to view or change the gain setting.
+        rain_list = raw_data.get("rain", [])
+        if rain_list:
+            _LOGGER.debug("Found rain data with %d items", len(rain_list))
+            # Force rain-array items to the tipping-bucket device (WN20, WH40, or WH69)
+            # so they are never mis-attributed to a piezoelectric sensor (WH90/WS90/WS85)
+            # that registers the same hex IDs (0x0D–0x13) for its piezoRain data.
+            # When more than one tipping-bucket device is registered (e.g. a WH69 and a
+            # separate WN20 both paired to the same gateway), only one of them is
+            # actually the live source for this block. Pick whichever registered
+            # candidate reports the strongest signal instead of assuming a fixed
+            # device always wins — a static WN20-always-wins rule incorrectly starved
+            # a genuinely active WH69 of its rain and battery entities when a WN20
+            # was also registered but not the true source (issue #239). Ties (equal
+            # signal, or no usable signal for either) fall back to the
+            # WN20 > WH69 > WH40 priority order used previously.
+            _rain_hw_id: Optional[str] = None
+            battery_key = "wh40batt"
+            _best_rank = (-1, -1)
+            for _batt_key, _priority in (
+                ("wn20batt", 2),
+                ("wh69batt", 1),
+                ("wh40batt", 0),
+            ):
+                _hw = self.sensor_mapper.get_hardware_id(_batt_key)
+                if not _hw:
+                    continue
+                _info = self.sensor_mapper.get_sensor_info(_hw) or {}
+                try:
+                    _signal_int = int(str(_info.get("signal", "")).strip())
+                except (TypeError, ValueError):
+                    _signal_int = -1
+                _rank = (_signal_int, _priority)
+                if _rank > _best_rank:
+                    _best_rank = _rank
+                    _rain_hw_id = _hw
+                    battery_key = _batt_key
+            for item in rain_list:
+                if (
+                    isinstance(item, dict)
+                    and item.get("id")
+                    and item.get("val") is not None
+                ):
+                    entry = {"id": item["id"], "val": item["val"]}
+                    if _rain_hw_id:
+                        entry["_force_hardware_id"] = _rain_hw_id
+                    all_sensor_items.append(entry)
+                    # Extract WH40/WH69/WN20 battery from the 0x13 (yearly rain) item,
+                    # attributed to whichever device won the rain block above.
+                    if item.get("id") == "0x13" and item.get("battery"):
+                        # WH40/WN20 use 0-5 bar scale; WH69 uses binary (0=full, 1=low).
+                        # Detect scale: values > 1 are clearly 0-5 bar scale.
+                        batt_str = str(item["battery"])
+                        batt_val = int(batt_str) if batt_str.isdigit() else -1
+                        if batt_val > 1:
+                            battery_pct = str(batt_val * 20)  # 0-5 bar scale
+                        else:
+                            battery_pct = "100" if batt_str == "0" else "10"  # binary
+                        all_sensor_items.append({"id": battery_key, "val": battery_pct})
+                        _LOGGER.debug(
+                            "Added rain battery: %s = %s%%", battery_key, battery_pct
+                        )
+
+        # Extract lightning data (WH57 lightning sensor)
+        lightning_data = raw_data.get("lightning", [])
+        if lightning_data and len(lightning_data) > 0:
+            _LOGGER.debug("Found lightning data: %s", lightning_data[0])
+            lightning_item = lightning_data[0]
+            if isinstance(lightning_item, dict):
+                if "count" in lightning_item:
+                    all_sensor_items.append(
+                        {"id": "lightning_num", "val": lightning_item["count"]}
+                    )
+                    _LOGGER.debug(
+                        "Added lightning strikes: %s", lightning_item["count"]
+                    )
+                if "date" in lightning_item:
+                    all_sensor_items.append(
+                        {"id": "lightning_time", "val": lightning_item["date"]}
+                    )
+                    _LOGGER.debug(
+                        "Added last lightning time: %s", lightning_item["date"]
+                    )
+                if "distance" in lightning_item:
+                    distance_str = (
+                        str(lightning_item["distance"]).replace(" km", "").strip()
+                    )
+                    all_sensor_items.append({"id": "lightning", "val": distance_str})
+                    _LOGGER.debug("Added lightning distance: %s km", distance_str)
+                if "battery" in lightning_item:
+                    battery = lightning_item["battery"]
+                    battery_pct = (
+                        str(int(battery) * 20) if str(battery).isdigit() else battery
+                    )
+                    all_sensor_items.append({"id": "wh57batt", "val": battery_pct})
+                    _LOGGER.debug("Added WH57 battery: wh57batt = %s%%", battery_pct)
+
+        # Extract ch_soil data (soil sensor readings)
+        ch_soil = raw_data.get("ch_soil", [])
+        if ch_soil:
+            _LOGGER.debug("Found ch_soil data with %d items", len(ch_soil))
+            # Process soil sensor data structure
+            for item in ch_soil:
+                _LOGGER.debug("ch_soil item: %s", item)
+                # Convert ch_soil format to standard format
+                if isinstance(item, dict):
+                    channel = item.get("channel")
+                    humidity = item.get("humidity", "").replace("%", "")
+                    battery = item.get("battery")
+
+                    if channel and humidity:
+                        # Create soil moisture sensor
+                        soil_key = f"soilmoisture{channel}"
+                        all_sensor_items.append({"id": soil_key, "val": humidity})
+                        _LOGGER.debug(
+                            "Added soil sensor: %s = %s%%", soil_key, humidity
+                        )
+
+                        # Create battery sensor if battery data exists
+                        if battery:
+                            battery_key = f"soilbatt{channel}"
+                            # Spec (V1.0.6 §7) defines WH51 battery as binary
+                            # (0=normal, 1=low) — same encoding as WH31 ch_aisle.
+                            # Some firmwares also report a 0-5 bar level, so accept
+                            # both: "0"=full, "1"=low, "2"-"5"=bar*20.
+                            if battery == "0":
+                                battery_pct = "100"
+                            elif battery == "1":
+                                battery_pct = "10"
+                            else:
+                                battery_pct = (
+                                    str(int(battery) * 20)
+                                    if battery.isdigit()
+                                    else battery
+                                )
+                            all_sensor_items.append(
+                                {"id": battery_key, "val": battery_pct}
+                            )
+                            _LOGGER.debug(
+                                "Added soil battery sensor: %s = %s",
+                                battery_key,
+                                battery_pct,
+                            )
+
+                        # Get signal strength from sensor mapping (we'll add this in processing)
+
+        # Extract ch_ec data (WH52 soil sensor: moisture + temperature + conductivity)
+        ch_ec = raw_data.get("ch_ec", [])
+        if ch_ec:
+            _LOGGER.debug("Found ch_ec data with %d items", len(ch_ec))
+            for item in ch_ec:
+                _LOGGER.debug("ch_ec item: %s", item)
+                if isinstance(item, dict):
+                    channel = item.get("channel")
+                    if not channel:
+                        continue
+
+                    # Soil moisture
+                    humidity_str = item.get("humidity", "")
+                    if humidity_str:
+                        humidity_val = str(humidity_str).replace("%", "").strip()
+                        soil_key = f"soilmoisture{channel}"
+                        all_sensor_items.append({"id": soil_key, "val": humidity_val})
+                        _LOGGER.debug(
+                            "Added WH52 soil moisture: %s = %s%%",
+                            soil_key,
+                            humidity_val,
+                        )
+
+                    # Soil temperature
+                    temp_val = item.get("temp")
+                    temp_unit = item.get("unit", "C")
+                    if temp_val:
+                        temp_key = f"soiltemp{channel}"
+                        all_sensor_items.append(
+                            {"id": temp_key, "val": temp_val, "unit": temp_unit}
+                        )
+                        _LOGGER.debug(
+                            "Added WH52 soil temp: %s = %s %s",
+                            temp_key,
+                            temp_val,
+                            temp_unit,
+                        )
+
+                    # Electrical conductivity
+                    ec_val = item.get("ec", "")
+                    if ec_val:
+                        ec_key = f"soilec{channel}"
+                        all_sensor_items.append({"id": ec_key, "val": str(ec_val)})
+                        _LOGGER.debug("Added WH52 soil EC: %s = %s", ec_key, ec_val)
+
+                    # Battery
+                    battery = item.get("battery")
+                    if battery and str(battery) != "None":
+                        battery_key = f"soilbatt{channel}"
+                        battery_pct = (
+                            str(int(battery) * 20)
+                            if str(battery).isdigit()
+                            else str(battery)
+                        )
+                        all_sensor_items.append({"id": battery_key, "val": battery_pct})
+                        _LOGGER.debug(
+                            "Added WH52 battery: %s = %s%%", battery_key, battery_pct
+                        )
+
+        # Extract wh25 data (indoor temp/humidity/pressure)
+        wh25_data = raw_data.get("wh25", [])
+        if wh25_data and len(wh25_data) > 0:
+            _LOGGER.debug("Found wh25 data: %s", wh25_data[0])
+            wh25_item = wh25_data[0]
+            if isinstance(wh25_item, dict):
+                # Indoor temperature — pass unit from gateway data so HA uses the correct unit
+                # (without this, the entity falls back to SENSOR_TYPES default "°C",
+                # causing Fahrenheit values to be displayed in the wrong scale)
+                if "intemp" in wh25_item:
+                    temp_val = wh25_item["intemp"]
+                    temp_unit = wh25_item.get("unit", "F")
+                    all_sensor_items.append(
+                        {"id": "tempinf", "val": temp_val, "unit": temp_unit}
+                    )
+                    _LOGGER.debug(
+                        "Added indoor temp: tempinf = %s (%s)", temp_val, temp_unit
+                    )
+
+                # Indoor humidity
+                if "inhumi" in wh25_item:
+                    humi_val = wh25_item["inhumi"].replace("%", "")
+                    all_sensor_items.append({"id": "humidityin", "val": humi_val})
+                    _LOGGER.debug("Added indoor humidity: humidityin = %s", humi_val)
+
+                # Absolute pressure
+                if "abs" in wh25_item:
+                    abs_val = wh25_item["abs"].replace(" hPa", "")
+                    _LOGGER.debug(
+                        "Raw absolute pressure from gateway: '%s', cleaned: '%s'",
+                        wh25_item["abs"],
+                        abs_val,
+                    )
+                    all_sensor_items.append({"id": "baromabsin", "val": abs_val})
+                    _LOGGER.debug("Added absolute pressure: baromabsin = %s", abs_val)
+
+                # Relative pressure
+                if "rel" in wh25_item:
+                    rel_val = wh25_item["rel"].replace(" hPa", "")
+                    _LOGGER.debug(
+                        "Raw relative pressure from gateway: '%s', cleaned: '%s'",
+                        wh25_item["rel"],
+                        rel_val,
+                    )
+                    all_sensor_items.append({"id": "baromrelin", "val": rel_val})
+                    _LOGGER.debug("Added relative pressure: baromrelin = %s", rel_val)
+
+        # Extract piezoRain data (rain sensor readings from WS90/WH90/WS85)
+        piezo_rain = raw_data.get("piezoRain", [])
+        if piezo_rain:
+            _LOGGER.debug("Found piezoRain data with %d items", len(piezo_rain))
+            # Force piezoRain items to the piezoelectric device (WS85 > WS90 > WH90) so
+            # they are never mis-attributed to a tipping-bucket sensor (WH40/WH69) that
+            # registers the same hex IDs (0x0D–0x13) for its rain-array data.
+            _piezo_hw_id = (
+                self.sensor_mapper.get_hardware_id("ws85batt")
+                or self.sensor_mapper.get_hardware_id("ws90batt")
+                or self.sensor_mapper.get_hardware_id("wh90batt")
+            )
+            # Process rain sensor data structure
+            for item in piezo_rain:
+                _LOGGER.debug("piezoRain item: %s", item)
+                # Add rain sensor readings to main sensor list
+                if isinstance(item, dict) and "id" in item and "val" in item:
+                    sensor_id = item["id"]
+                    sensor_val = item["val"]
+                    piezo_entry = {"id": sensor_id, "val": sensor_val}
+                    if _piezo_hw_id:
+                        piezo_entry["_force_hardware_id"] = _piezo_hw_id
+                    all_sensor_items.append(piezo_entry)
+                    _LOGGER.debug("Added rain sensor: %s = %s", sensor_id, sensor_val)
+
+                    # Add battery sensor if present in the item
+                    if "battery" in item and item["battery"]:
+                        # For WS90/WH90/WS85, battery is in the last piezoRain item (0x13).
+                        # Detect which device owns this piezoRain data by checking which
+                        # battery key is registered in sensor_mapper.
+                        if (
+                            sensor_id == "0x13"
+                        ):  # Total rain - usually the last item with battery info
+                            if (
+                                self.sensor_mapper.get_hardware_id("ws85batt")
+                                is not None
+                            ):
+                                battery_key = "ws85batt"
+                                volt_key = "ws85_voltage"
+                                cap_field = "ws85cap_volt"
+                                cap_key = "ws85cap_volt"
+                            elif (
+                                self.sensor_mapper.get_hardware_id("ws90batt")
+                                is not None
+                            ):
+                                battery_key = "ws90batt"
+                                volt_key = "ws90_voltage"
+                                cap_field = "ws90cap_volt"
+                                cap_key = "ws90cap_volt"
+                            else:
+                                battery_key = "wh90batt"
+                                volt_key = "wh90_voltage"
+                                cap_field = "ws90cap_volt"
+                                cap_key = "wh90cap_volt"
+                            battery_val = (
+                                str(int(item["battery"]) * 20)
+                                if item["battery"].isdigit()
+                                else item["battery"]
+                            )
+                            all_sensor_items.append(
+                                {"id": battery_key, "val": battery_val}
+                            )
+                            _LOGGER.debug(
+                                "Added piezo battery sensor: %s = %s%%",
+                                battery_key,
+                                battery_val,
+                            )
+
+                            # Add battery voltage if present
+                            if item.get("voltage"):
+                                all_sensor_items.append(
+                                    {"id": volt_key, "val": item["voltage"]}
+                                )
+                                _LOGGER.debug(
+                                    "Added piezo battery voltage: %s = %sV",
+                                    volt_key,
+                                    item["voltage"],
+                                )
+
+                            # Add capacitor voltage if present (field name varies by device)
+                            if item.get(cap_field):
+                                all_sensor_items.append(
+                                    {"id": cap_key, "val": item[cap_field]}
+                                )
+                                _LOGGER.debug(
+                                    "Added piezo capacitor voltage: %s = %sV",
+                                    cap_key,
+                                    item[cap_field],
+                                )
+
+        # Extract ch_aisle data (WH31 temperature/humidity sensors)
+        ch_aisle = raw_data.get("ch_aisle", [])
+        if ch_aisle:
+            _LOGGER.debug("Found ch_aisle data with %d items", len(ch_aisle))
+            # Process WH31 sensor data structure
+            for item in ch_aisle:
+                _LOGGER.debug("ch_aisle item: %s", item)
+                # Convert ch_aisle format to standard format
+                if isinstance(item, dict):
+                    channel = item.get("channel")
+                    temp = item.get("temp")
+                    humidity = item.get("humidity")
+                    battery = item.get("battery")
+
+                    if channel:
+                        # Create temperature sensor if temp data exists
+                        if temp and temp != "None":
+                            temp_key = f"temp{channel}f"
+                            # Pass the actual gateway unit so the coordinator overrides the
+                            # SENSOR_TYPES "°F" default. Ecowitt firmware always reports
+                            # "unit": "F" in ch_aisle even when the gateway is in Celsius mode.
+                            all_sensor_items.append(
+                                {
+                                    "id": temp_key,
+                                    "val": temp,
+                                    "unit": self._gateway_temp_unit,
+                                }
+                            )
+                            _LOGGER.debug(
+                                "Added WH31 temperature sensor: %s = %s (%s)",
+                                temp_key,
+                                temp,
+                                self._gateway_temp_unit,
+                            )
+
+                        # Create humidity sensor if humidity data exists
+                        if humidity and humidity != "None":
+                            humidity_val = humidity.replace("%", "")
+                            humidity_key = f"humidity{channel}"
+                            all_sensor_items.append(
+                                {"id": humidity_key, "val": humidity_val}
+                            )
+                            _LOGGER.debug(
+                                "Added WH31 humidity sensor: %s = %s%%",
+                                humidity_key,
+                                humidity_val,
+                            )
+
+                        # Create battery sensor if battery data exists
+                        if battery and battery != "None":
+                            battery_key = f"batt{channel}"
+                            # WH31/WH69 ch_aisle battery is binary: "0"=OK(100%), "1"=weak(10%)
+                            if battery == "0":
+                                battery_pct = "100"
+                            elif battery == "1":
+                                battery_pct = "10"
+                            else:
+                                battery_pct = (
+                                    str(int(battery) * 20)
+                                    if battery.isdigit()
+                                    else battery
+                                )
+                            all_sensor_items.append(
+                                {"id": battery_key, "val": battery_pct}
+                            )
+                            _LOGGER.debug(
+                                "Added WH31 battery sensor: %s = %s%%",
+                                battery_key,
+                                battery_pct,
+                            )
+
+        # Extract ch_temp data (WH34 wired temperature sensors)
+        ch_temp = raw_data.get("ch_temp", [])
+        if ch_temp:
+            _LOGGER.debug("Found ch_temp data with %d items", len(ch_temp))
+            for item in ch_temp:
+                _LOGGER.debug("ch_temp item: %s", item)
+                if isinstance(item, dict):
+                    channel = item.get("channel")
+                    temp = item.get("temp")
+                    battery = item.get("battery")
+
+                    if channel:
+                        if temp and temp != "None":
+                            temp_key = f"tf_ch{channel}"
+                            # Same as ch_aisle: Ecowitt firmware reports the raw value; apply
+                            # the actual gateway unit to avoid double-conversion.
+                            all_sensor_items.append(
+                                {
+                                    "id": temp_key,
+                                    "val": temp,
+                                    "unit": self._gateway_temp_unit,
+                                }
+                            )
+                            _LOGGER.debug(
+                                "Added WH34 temperature sensor: %s = %s (%s)",
+                                temp_key,
+                                temp,
+                                self._gateway_temp_unit,
+                            )
+
+                        if battery and battery != "None":
+                            battery_key = f"tf_batt{channel}"
+                            battery_pct = (
+                                str(int(battery) * 20) if battery.isdigit() else battery
+                            )
+                            all_sensor_items.append(
+                                {"id": battery_key, "val": battery_pct}
+                            )
+                            _LOGGER.debug(
+                                "Added WH34 battery sensor: %s = %s%%",
+                                battery_key,
+                                battery_pct,
+                            )
+
+        # Extract ch_pm25 data (WH41 PM2.5 air quality sensors)
+        ch_pm25 = raw_data.get("ch_pm25", [])
+        if ch_pm25:
+            _LOGGER.debug("Found ch_pm25 data with %d items", len(ch_pm25))
+            for item in ch_pm25:
+                _LOGGER.debug("ch_pm25 item: %s", item)
+                if isinstance(item, dict):
+                    channel = item.get("channel")
+                    # Real-time PM2.5 concentration (gateway may use lowercase or uppercase key)
+                    pm25_val = item.get("pm25") or item.get("PM25")
+                    # 24-hour average PM2.5 concentration. Per spec (V1.0.6 §1)
+                    # the ch_pm25 block does NOT expose a 24h concentration —
+                    # only PM25_24HAQI (an AQI index, dimensionless 0–500).
+                    # Some firmwares still emit pm25_avg_24h/pm25_24h, so accept
+                    # those if present, but treat PM25_24HAQI as the AQI index
+                    # it is (separate entity below).
+                    pm25_24h_val = item.get("pm25_avg_24h") or item.get("pm25_24h")
+                    # Real-time and 24-hour AQI indices (dimensionless 0–500)
+                    pm25_realaqi_val = item.get("PM25_RealAQI")
+                    pm25_24haqi_val = item.get("PM25_24HAQI")
+                    battery = item.get("battery")
+
+                    if channel:
+                        if pm25_val and pm25_val != "None":
+                            pm25_key = f"pm25_ch{channel}"
+                            all_sensor_items.append({"id": pm25_key, "val": pm25_val})
+                            _LOGGER.debug(
+                                "Added PM2.5 sensor: %s = %s", pm25_key, pm25_val
+                            )
+
+                        if pm25_24h_val and pm25_24h_val != "None":
+                            pm25_24h_key = f"pm25_avg_24h_ch{channel}"
+                            all_sensor_items.append(
+                                {"id": pm25_24h_key, "val": pm25_24h_val}
+                            )
+                            _LOGGER.debug(
+                                "Added PM2.5 24h avg sensor: %s = %s",
+                                pm25_24h_key,
+                                pm25_24h_val,
+                            )
+
+                        if pm25_realaqi_val and pm25_realaqi_val != "None":
+                            realaqi_key = f"pm25_aqi_realtime_ch{channel}"
+                            all_sensor_items.append(
+                                {"id": realaqi_key, "val": pm25_realaqi_val}
+                            )
+                            _LOGGER.debug(
+                                "Added PM2.5 real-time AQI sensor: %s = %s",
+                                realaqi_key,
+                                pm25_realaqi_val,
+                            )
+
+                        if pm25_24haqi_val and pm25_24haqi_val != "None":
+                            aqi_24h_key = f"pm25_aqi_24h_ch{channel}"
+                            all_sensor_items.append(
+                                {"id": aqi_24h_key, "val": pm25_24haqi_val}
+                            )
+                            _LOGGER.debug(
+                                "Added PM2.5 24h AQI sensor: %s = %s",
+                                aqi_24h_key,
+                                pm25_24haqi_val,
+                            )
+
+                        if battery and battery != "None":
+                            battery_key = f"pm25batt{channel}"
+                            battery_pct = (
+                                str(int(battery) * 20)
+                                if str(battery).isdigit()
+                                else battery
+                            )
+                            all_sensor_items.append(
+                                {"id": battery_key, "val": battery_pct}
+                            )
+                            _LOGGER.debug(
+                                "Added PM2.5 battery sensor: %s = %s%%",
+                                battery_key,
+                                battery_pct,
+                            )
+
+        # Extract ch_leaf data (WH35 leaf wetness sensors)
+        ch_leaf = raw_data.get("ch_leaf", [])
+        if ch_leaf:
+            _LOGGER.debug("Found ch_leaf data with %d items", len(ch_leaf))
+            for item in ch_leaf:
+                _LOGGER.debug("ch_leaf item: %s", item)
+                if isinstance(item, dict):
+                    channel = item.get("channel")
+                    humidity = item.get("humidity", "").replace("%", "").strip()
+                    battery = item.get("battery")
+
+                    if channel:
+                        if humidity:
+                            leaf_key = f"leafwetness_ch{channel}"
+                            all_sensor_items.append({"id": leaf_key, "val": humidity})
+                            _LOGGER.debug(
+                                "Added leaf wetness sensor: %s = %s%%",
+                                leaf_key,
+                                humidity,
+                            )
+
+                        if battery and battery != "None":
+                            battery_key = f"leaf_batt{channel}"
+                            battery_pct = (
+                                str(int(battery) * 20)
+                                if str(battery).isdigit()
+                                else battery
+                            )
+                            all_sensor_items.append(
+                                {"id": battery_key, "val": battery_pct}
+                            )
+                            _LOGGER.debug(
+                                "Added leaf wetness battery sensor: %s = %s%%",
+                                battery_key,
+                                battery_pct,
+                            )
+
+        # Extract ch_leak data (WH55 leak detection sensors). Some gateways (e.g.
+        # GW1200B firmware 1.4.6) report WH55 only via this livedata array — there
+        # is no matching wh55 entry in get_sensors_info — so the sensor_mapper
+        # cannot register hardware IDs and entities won't be created without an
+        # explicit ch_leak handler here.
+        ch_leak = raw_data.get("ch_leak", [])
+        if ch_leak:
+            _LOGGER.debug("Found ch_leak data with %d items", len(ch_leak))
+            for item in ch_leak:
+                _LOGGER.debug("ch_leak item: %s", item)
+                if isinstance(item, dict):
+                    channel = item.get("channel")
+                    status = item.get("status")
+                    battery = item.get("battery")
+
+                    if channel:
+                        if status is not None and str(status) != "":
+                            leak_key = f"leak_ch{channel}"
+                            # WH55 reports "Normal" when dry; any other value
+                            # ("Leakage", "Leak", etc.) means water detected.
+                            leak_val = (
+                                "0" if str(status).strip().lower() == "normal" else "1"
+                            )
+                            all_sensor_items.append({"id": leak_key, "val": leak_val})
+                            _LOGGER.debug(
+                                "Added WH55 leak sensor: %s = %s (status=%s)",
+                                leak_key,
+                                leak_val,
+                                status,
+                            )
+
+                        if battery is not None and str(battery) != "None":
+                            battery_key = f"leakbatt{channel}"
+                            battery_pct = (
+                                str(int(battery) * 20)
+                                if str(battery).isdigit()
+                                else battery
+                            )
+                            all_sensor_items.append(
+                                {"id": battery_key, "val": battery_pct}
+                            )
+                            _LOGGER.debug(
+                                "Added WH55 leak battery sensor: %s = %s%%",
+                                battery_key,
+                                battery_pct,
+                            )
+
+        # Extract ch_lds data (WH54 liquid depth sensors — types 66–69, channels 1–4)
+        ch_lds = raw_data.get("ch_lds", [])
+        if ch_lds:
+            _LOGGER.debug("Found ch_lds data with %d items", len(ch_lds))
+            for item in ch_lds:
+                _LOGGER.debug("ch_lds item: %s", item)
+                if isinstance(item, dict):
+                    channel = item.get("channel")
+                    if not channel:
+                        continue
+
+                    air = item.get("air")
+                    if air and str(air) != "None":
+                        air_key = f"lds_air_ch{channel}"
+                        all_sensor_items.append({"id": air_key, "val": str(air)})
+                        _LOGGER.debug("Added WH54 air gap: %s = %s", air_key, air)
+
+                    depth = item.get("depth")
+                    if depth and str(depth) != "None":
+                        depth_key = f"lds_depth_ch{channel}"
+                        all_sensor_items.append({"id": depth_key, "val": str(depth)})
+                        _LOGGER.debug("Added WH54 depth: %s = %s", depth_key, depth)
+
+                    voltage = item.get("voltage")
+                    if voltage and str(voltage) != "None":
+                        volt_key = f"lds_voltage_ch{channel}"
+                        all_sensor_items.append({"id": volt_key, "val": str(voltage)})
+                        _LOGGER.debug("Added WH54 voltage: %s = %sV", volt_key, voltage)
+
+                    battery = item.get("battery")
+                    if battery is not None and str(battery) != "None":
+                        battery_key = f"lds_batt{channel}"
+                        battery_pct = (
+                            str(int(battery) * 20)
+                            if str(battery).isdigit()
+                            else str(battery)
+                        )
+                        all_sensor_items.append({"id": battery_key, "val": battery_pct})
+                        _LOGGER.debug(
+                            "Added WH54 battery: %s = %s%%", battery_key, battery_pct
+                        )
+
+        # Extract co2 data (WH45 combo sensor: CO2 + PM2.5 + PM10 + temp/humidity)
+        co2_array = raw_data.get("co2", [])
+        if co2_array:
+            _LOGGER.debug("Found co2 data with %d items", len(co2_array))
+            co2_item = co2_array[0]  # WH45 is a single sensor (no channels)
+            if isinstance(co2_item, dict):
+                temp_val = co2_item.get("temp")
+                temp_unit = co2_item.get("unit", "C")
+                if temp_val:
+                    temp_key = "tf_co2c" if temp_unit == "C" else "tf_co2"
+                    all_sensor_items.append(
+                        {"id": temp_key, "val": temp_val, "unit": temp_unit}
+                    )
+                    _LOGGER.debug(
+                        "Added WH45 temp: %s = %s %s", temp_key, temp_val, temp_unit
+                    )
+
+                humidity_str = co2_item.get("humidity", "")
+                if humidity_str:
+                    humidity_val = str(humidity_str).replace("%", "").strip()
+                    all_sensor_items.append({"id": "humi_co2", "val": humidity_val})
+                    _LOGGER.debug("Added WH45 humidity: humi_co2 = %s", humidity_val)
+
+                pm25_val = co2_item.get("PM25") or co2_item.get("pm25")
+                if pm25_val:
+                    all_sensor_items.append({"id": "pm25_co2", "val": str(pm25_val)})
+                    _LOGGER.debug("Added WH45 PM2.5: pm25_co2 = %s", pm25_val)
+
+                pm25_24h_val = co2_item.get("PM25_24H") or co2_item.get("pm25_24h")
+                if pm25_24h_val:
+                    all_sensor_items.append(
+                        {"id": "pm25_24h_co2", "val": str(pm25_24h_val)}
+                    )
+                    _LOGGER.debug(
+                        "Added WH45 PM2.5 24h avg: pm25_24h_co2 = %s", pm25_24h_val
+                    )
+
+                pm10_val = co2_item.get("PM10") or co2_item.get("pm10")
+                if pm10_val:
+                    all_sensor_items.append({"id": "pm10_co2", "val": str(pm10_val)})
+                    _LOGGER.debug("Added WH45 PM10: pm10_co2 = %s", pm10_val)
+
+                pm10_24h_val = co2_item.get("PM10_24H") or co2_item.get("pm10_24h")
+                if pm10_24h_val:
+                    all_sensor_items.append(
+                        {"id": "pm10_24h_co2", "val": str(pm10_24h_val)}
+                    )
+                    _LOGGER.debug(
+                        "Added WH45 PM10 24h avg: pm10_24h_co2 = %s", pm10_24h_val
+                    )
+
+                pm1_val = co2_item.get("PM1") or co2_item.get("pm1")
+                if pm1_val:
+                    all_sensor_items.append({"id": "pm1_co2", "val": str(pm1_val)})
+                    _LOGGER.debug("Added WH46D PM1.0: pm1_co2 = %s", pm1_val)
+
+                pm1_24h_val = co2_item.get("PM1_24H") or co2_item.get("pm1_24h")
+                if pm1_24h_val:
+                    all_sensor_items.append(
+                        {"id": "pm1_24h_co2", "val": str(pm1_24h_val)}
+                    )
+                    _LOGGER.debug(
+                        "Added WH46D PM1.0 24h avg: pm1_24h_co2 = %s", pm1_24h_val
+                    )
+
+                pm4_val = co2_item.get("PM4") or co2_item.get("pm4")
+                if pm4_val:
+                    all_sensor_items.append({"id": "pm4_co2", "val": str(pm4_val)})
+                    _LOGGER.debug("Added WH46D PM4.0: pm4_co2 = %s", pm4_val)
+
+                pm4_24h_val = co2_item.get("PM4_24H") or co2_item.get("pm4_24h")
+                if pm4_24h_val:
+                    all_sensor_items.append(
+                        {"id": "pm4_24h_co2", "val": str(pm4_24h_val)}
+                    )
+                    _LOGGER.debug(
+                        "Added WH46D PM4.0 24h avg: pm4_24h_co2 = %s", pm4_24h_val
+                    )
+
+                # AQI index fields (dimensionless 0–500). Spec V1.0.6 §1 co2 block.
+                for _pm_key, _co2_key in (
+                    ("PM25_RealAQI", "pm25_realaqi_co2"),
+                    ("PM25_24HAQI", "pm25_24haqi_co2"),
+                    ("PM10_RealAQI", "pm10_realaqi_co2"),
+                    ("PM10_24HAQI", "pm10_24haqi_co2"),
+                    ("PM1_RealAQI", "pm1_realaqi_co2"),
+                    ("PM1_24HAQI", "pm1_24haqi_co2"),
+                    ("PM4_RealAQI", "pm4_realaqi_co2"),
+                    ("PM4_24HAQI", "pm4_24haqi_co2"),
+                ):
+                    _aqi_val = co2_item.get(_pm_key)
+                    if _aqi_val and str(_aqi_val) != "None":
+                        all_sensor_items.append({"id": _co2_key, "val": str(_aqi_val)})
+                        _LOGGER.debug("Added WH45 AQI: %s = %s", _co2_key, _aqi_val)
+
+                co2_val = co2_item.get("CO2") or co2_item.get("CO2_val")
+                if co2_val:
+                    all_sensor_items.append({"id": "co2", "val": str(co2_val)})
+                    _LOGGER.debug("Added WH45 CO2: co2 = %s", co2_val)
+
+                co2_24h_val = co2_item.get("CO2_24H") or co2_item.get("co2_24h_val")
+                if co2_24h_val:
+                    all_sensor_items.append({"id": "co2_24h", "val": str(co2_24h_val)})
+                    _LOGGER.debug("Added WH45 CO2 24h avg: co2_24h = %s", co2_24h_val)
+
+                battery = co2_item.get("battery")
+                if battery and str(battery) != "None":
+                    battery_pct = (
+                        str(min(int(battery) * 20, 100))
+                        if str(battery).isdigit()
+                        else str(battery)
+                    )
+                    all_sensor_items.append({"id": "co2_batt", "val": battery_pct})
+                    _LOGGER.debug("Added WH45 battery: co2_batt = %s%%", battery_pct)
+
+        # Fetch soil AD (analog-to-digital) calibration data from /get_cli_soilad
+        try:
+            soil_cal = await self.api.get_soil_calibration()
+            if soil_cal:
+                _LOGGER.debug(
+                    "Found soil calibration data with %d items", len(soil_cal)
+                )
+                for item in soil_cal:
+                    if isinstance(item, dict):
+                        ch = item.get("ch")
+                        now_ad = item.get("nowAd")
+                        if ch and now_ad is not None:
+                            ad_key = f"soilad{ch}"
+                            all_sensor_items.append({"id": ad_key, "val": str(now_ad)})
+                            _LOGGER.debug(
+                                "Added soil AD sensor: %s = %s", ad_key, now_ad
+                            )
+        except Exception as err:
+            _LOGGER.debug("Could not fetch soil AD data: %s", err)
+
+        # Fetch LDS config data from /get_cli_lds (level and total_heat — spec V1.0.4+)
+        try:
+            lds_config = await self.api.get_lds_config()
+            if lds_config:
+                _LOGGER.debug("Found LDS config data with %d items", len(lds_config))
+                for item in lds_config:
+                    if isinstance(item, dict):
+                        ch = item.get("ch")
+                        if not ch:
+                            continue
+                        level = item.get("level")
+                        if level is not None and str(level) != "None":
+                            level_key = f"lds_level_ch{ch}"
+                            all_sensor_items.append(
+                                {"id": level_key, "val": str(level)}
+                            )
+                            _LOGGER.debug(
+                                "Added WH54 filter level: %s = %s", level_key, level
+                            )
+                        total_heat = item.get("total_heat")
+                        if total_heat is not None and str(total_heat) != "None":
+                            heat_key = f"lds_total_heat_ch{ch}"
+                            all_sensor_items.append(
+                                {"id": heat_key, "val": str(total_heat)}
+                            )
+                            _LOGGER.debug(
+                                "Added WH54 heater counter: %s = %s",
+                                heat_key,
+                                total_heat,
+                            )
+        except Exception as err:
+            _LOGGER.debug("Could not fetch LDS config data: %s", err)
+
+        _LOGGER.debug("Total sensor items to process: %d", len(all_sensor_items))
+
+        for item in all_sensor_items:
+            sensor_key = item.get("id") or ""
+            sensor_value = item.get("val") or ""
+            item_unit = item.get(
+                "unit"
+            )  # Check for separate unit field (e.g., {"id": "0x02", "val": "43.7", "unit": "F"})
+
+            if not sensor_key:
+                continue
+
+            # Skip purely numeric decimal-string keys with no SENSOR_TYPES entry.
+            # The V1.0.6 spec defines "3" (Feels Like) and "5" (VPD), both in
+            # SENSOR_TYPES. Other numeric ids like "4" appear on some gateways
+            # but are not in the spec and would create entities with no metadata.
+            if sensor_key.isdigit() and sensor_key not in SENSOR_TYPES:
+                _LOGGER.debug(
+                    "Skipping unknown decimal-id sensor key '%s' (not in V1.0.6 spec)",
+                    sensor_key,
+                )
+                continue
+
+            # Skip empty values unless we include inactive sensors
+            if not sensor_value and not self._include_inactive:
+                _LOGGER.debug(
+                    "Skipping sensor %s with empty value (include_inactive=%s)",
+                    sensor_key,
+                    self._include_inactive,
+                )
+                continue
+
+            # Extract unit from either the separate "unit" field OR embedded in the value
+            embedded_unit = None
+            numeric_value = sensor_value
+
+            # First, check for separate "unit" field in the item (temperature sensors use this)
+            if item_unit:
+                # Normalize unit to standard Home Assistant format
+                embedded_unit = self._normalize_unit(item_unit)
+                _LOGGER.debug(
+                    "Found unit field in item: '%s' -> normalized='%s'",
+                    item_unit,
+                    embedded_unit,
+                )
+            # Otherwise, try to extract unit from value string (e.g., "2.24 mph")
+            elif sensor_value and isinstance(sensor_value, str):
+                import re
+
+                match = re.match(
+                    r"^([-+]?\d*\.?\d+)\s*([a-zA-Z%°/]+.*)$", sensor_value.strip()
+                )
+                if match:
+                    numeric_value = match.group(1)
+                    embedded_unit = match.group(2).strip()
+                    if embedded_unit:
+                        # Normalize unit to standard Home Assistant format
+                        unit_normalized = self._normalize_unit(embedded_unit)
+
+                        _LOGGER.debug(
+                            "Extracted unit from value: '%s' -> numeric='%s', unit='%s' (normalized='%s')",
+                            sensor_value,
+                            numeric_value,
+                            embedded_unit,
+                            unit_normalized,
+                        )
+                        embedded_unit = unit_normalized  # Use normalized unit
+                        sensor_value = numeric_value  # Use just the numeric part
+
+            # Handle kilolux: some gateways report solar radiation in Klux when
+            # configured to use lux units. Convert to lux (×1000) for Home Assistant.
+            if embedded_unit and embedded_unit.upper() == "KLUX":
+                try:
+                    sensor_value = str(float(sensor_value) * 1000)
+                    numeric_value = sensor_value
+                except (ValueError, TypeError):
+                    pass
+                embedded_unit = "lx"
+
+            # Handle kilo foot-candles: some gateways report solar radiation in
+            # Kfc when configured to use foot-candle units. Convert to lux
+            # (1 Kfc = 10763.91 lx) for Home Assistant, same as the Klux case above.
+            if embedded_unit and embedded_unit.upper() == "KFC":
+                try:
+                    sensor_value = str(float(sensor_value) * 10763.91)
+                    numeric_value = sensor_value
+                except (ValueError, TypeError):
+                    pass
+                embedded_unit = "lx"
+
+            # Get hardware ID for this sensor (only for non-gateway sensors).
+            # Items from rain/piezoRain may carry a _force_hardware_id to resolve
+            # conflicts when tipping-bucket (WH40/WH69) and piezoelectric (WH90/WS90/WS85)
+            # sensors coexist and share the same hex IDs (0x0D–0x13).
+            hardware_id = None
+            if sensor_key not in GATEWAY_SENSORS:
+                hardware_id = item.get(
+                    "_force_hardware_id"
+                ) or self.sensor_mapper.get_hardware_id(sensor_key)
+                _LOGGER.debug("Hardware ID lookup for %s: %s", sensor_key, hardware_id)
+
+            # Generate entity information
+            entity_id, friendly_name = self.sensor_mapper.generate_entity_id(
+                sensor_key, hardware_id
+            )
+            _LOGGER.debug(
+                "Processing sensor: key=%s, value=%s, hardware_id=%s, entity_id=%s",
+                sensor_key,
+                sensor_value,
+                hardware_id,
+                entity_id,
+            )
+
+            # Get sensor type information
+            sensor_info = SENSOR_TYPES.get(sensor_key, {})
+            battery_info = BATTERY_SENSORS.get(sensor_key, {})
+            system_info = SYSTEM_SENSORS.get(sensor_key, {})
+            binary_info = BINARY_SENSORS.get(sensor_key, {})
+
+            # Determine sensor category
+            if battery_info:
+                category = "diagnostic"  # Move battery to diagnostic
+                device_class = "battery"
+                unit = "%"
+                _LOGGER.debug(
+                    "Battery sensor %s assigned to diagnostic category", sensor_key
+                )
+            elif system_info:
+                category = "system"
+                device_class = system_info.get("device_class") or ""
+                unit = system_info.get("unit") or ""
+            elif binary_info:
+                category = "binary"
+                device_class = binary_info.get("device_class") or ""
+                unit = ""
+            else:
+                category = "sensor"
+                device_class = sensor_info.get("device_class") or ""
+                unit = sensor_info.get("unit") or ""
+
+            # Override unit with detected unit from data if available
+            if embedded_unit:
+                unit = embedded_unit
+
+            # If the gateway reports illuminance (lx) for a sensor const.py defined
+            # as irradiance, override device_class to match the actual unit.
+            # This happens when the gateway's solar unit is set to "Lux" instead of "W/m²".
+            if unit == "lx" and device_class == "irradiance":
+                device_class = "illuminance"
+
+            # Get additional sensor information
+            sensor_details: Dict[str, Any] = {}
+            if hardware_id:
+                hardware_info = self.sensor_mapper.get_sensor_info(hardware_id)
+                if hardware_info:
+                    sensor_details = {
+                        "hardware_id": hardware_id,
+                        "channel": hardware_info.get("channel"),
+                        "device_model": hardware_info.get("device_model"),
+                        # Note: raw batt bar (0-5 scale from sensors_info) is intentionally
+                        # omitted here — it is NOT a percentage and must not be exposed as
+                        # "battery" attribute. Battery State Card and HA would misread it.
+                        # Battery percentage is exposed via the dedicated battery entity.
+                        "signal": hardware_info.get("signal"),
+                    }
+
+            # Convert battery values from 0-5 scale to 0-100%
+            converted_value = sensor_value
+            if battery_info and sensor_value and str(sensor_value).isdigit():
+                # Only convert if this is a raw 1-5 scale value
+                int_value = int(sensor_value)
+                if int_value <= 5:
+                    # Raw scale 1-5, convert to percentage
+                    converted_value = str(int_value * 20)
+                    _LOGGER.debug(
+                        "Converted battery value %s to %s%% for sensor %s",
+                        sensor_value,
+                        converted_value,
+                        sensor_key,
+                    )
+                else:
+                    # Already a percentage value, keep as is
+                    converted_value = sensor_value
+                    _LOGGER.debug(
+                        "Battery value %s already in percentage for sensor %s",
+                        sensor_value,
+                        sensor_key,
+                    )
+            else:
+                converted_value = self._convert_sensor_value(sensor_value, unit)
+
+            # Store processed sensor data
+            sensors_data[entity_id] = {
+                "entity_id": entity_id,
+                "name": friendly_name,
+                "state": converted_value,
+                "unit_of_measurement": unit,
+                "device_class": device_class,
+                "state_class": sensor_info.get("state_class") or "",
+                "entity_category": sensor_info.get("entity_category"),
+                "enabled_default": sensor_info.get("enabled_default"),
+                "suggested_display_precision": sensor_info.get(
+                    "suggested_display_precision"
+                ),
+                "category": category,
+                "sensor_key": sensor_key,
+                "hardware_id": hardware_id,
+                "raw_value": sensor_value,
+                "attributes": {
+                    "sensor_key": sensor_key,
+                    "last_update": datetime.now().isoformat(),
+                    **sensor_details,
+                },
+            }
+
+            # Solar radiation secondary entity:
+            # - hex 0x15 (W/m²): also compute Solar Illuminance in lx = val × 126.7
+            # - non-hex 'solarradiation' (W/m²): same lux computation
+            # - non-hex 'solarradiation' (lx): rename primary entity to "Solar Illuminance"
+            #   and compute Solar Radiation in W/m² = val / 126.7
+            if sensor_key in ("0x15", "solarradiation") and sensor_value:
+                if unit == "W/m²":
+                    try:
+                        lux_val = round(float(sensor_value) * 126.7, 1)
+                        lux_entity_id, lux_name = self.sensor_mapper.generate_entity_id(
+                            "solar_lux", hardware_id
+                        )
+                        lux_sensor_info = SENSOR_TYPES.get("solar_lux", {})
+                        sensors_data[lux_entity_id] = {
+                            "entity_id": lux_entity_id,
+                            "name": lux_name,
+                            "state": str(lux_val),
+                            "unit_of_measurement": "lx",
+                            "device_class": "illuminance",
+                            "state_class": lux_sensor_info.get("state_class")
+                            or "measurement",
+                            "category": "sensor",
+                            "sensor_key": "solar_lux",
+                            "hardware_id": hardware_id,
+                            "raw_value": str(lux_val),
+                            "attributes": {
+                                "sensor_key": "solar_lux",
+                                "last_update": datetime.now().isoformat(),
+                                **sensor_details,
+                            },
+                        }
+                        _LOGGER.debug(
+                            "Added computed solar_lux entity: %s = %s lx (from %s W/m²)",
+                            lux_entity_id,
+                            lux_val,
+                            sensor_value,
+                        )
+                    except (ValueError, TypeError):
+                        pass
+                elif unit == "lx" and sensor_key in ("solarradiation", "0x15"):
+                    # Gateway is in lux mode: rename the primary entity to Solar Illuminance
+                    # and add a derived Solar Radiation entity in W/m².
+                    # Applies to both the non-hex 'solarradiation' key (WH68) and the
+                    # hex '0x15' key (WH90/WS90) when the gateway is configured for lux output.
+                    sensors_data[entity_id]["name"] = "Solar Illuminance"
+                    try:
+                        wm2_val = round(float(sensor_value) / 126.7, 1)
+                        wm2_entity_id = entity_id.replace(
+                            "solar_radiation", "solar_radiation_wm2"
+                        )
+                        wm2_sensor_key = f"{sensor_key}_wm2"
+                        sensors_data[wm2_entity_id] = {
+                            "entity_id": wm2_entity_id,
+                            "name": "Solar Radiation",
+                            "state": str(wm2_val),
+                            "unit_of_measurement": "W/m²",
+                            "device_class": "irradiance",
+                            "state_class": "measurement",
+                            "category": "sensor",
+                            "sensor_key": wm2_sensor_key,
+                            "hardware_id": hardware_id,
+                            "raw_value": str(wm2_val),
+                            "attributes": {
+                                "sensor_key": wm2_sensor_key,
+                                "last_update": datetime.now().isoformat(),
+                                **sensor_details,
+                            },
+                        }
+                        _LOGGER.debug(
+                            "Added computed Solar Radiation entity: %s = %s W/m² (from %s lx)",
+                            wm2_entity_id,
+                            wm2_val,
+                            sensor_value,
+                        )
+                    except (ValueError, TypeError):
+                        pass
+
+        # Add diagnostic and signal strength sensors for hardware devices
+        self._add_diagnostic_and_signal_sensors(sensors_data)
+
+        # Process gateway information
+        processed_data["gateway_info"] = await self._process_gateway_info()
+
+        _LOGGER.debug("Processed data summary: %d sensors total", len(sensors_data))
+        for entity_id, sensor_info in sensors_data.items():
+            _LOGGER.debug(
+                "Final sensor: %s -> category=%s, key=%s, value=%s",
+                entity_id,
+                sensor_info.get("category"),
+                sensor_info.get("sensor_key"),
+                sensor_info.get("state"),
+            )
+
+        return processed_data
+
+    def _add_diagnostic_and_signal_sensors(self, sensors_data: Dict[str, Any]) -> None:
+        """Add signal strength and diagnostic sensors for hardware devices."""
+        # Track which hardware IDs we've already added diagnostics for
+        added_hardware_ids = set()
+
+        # Create a copy of the values to avoid "dictionary changed size during iteration" error
+        for sensor_info in list(sensors_data.values()):
+            hardware_id = sensor_info.get("hardware_id")
+            if not hardware_id or hardware_id in added_hardware_ids:
+                continue
+
+            # Get hardware info from sensor mapper
+            hardware_info = self.sensor_mapper.get_sensor_info(hardware_id)
+            if not hardware_info:
+                continue
+
+            channel = hardware_info.get("channel")
+            signal = hardware_info.get("signal")
+
+            # Add Signal Strength sensor (regular sensor, same level as battery)
+            if signal and signal not in ("--", ""):
+                signal_entity_id = (
+                    f"sensor.ecowitt_signal_strength_{hardware_id.lower()}"
+                )
+                # Convert signal strength (0-4 scale to 0-100%)
+                signal_pct = str(int(signal) * 25) if signal.isdigit() else signal
+                sensors_data[signal_entity_id] = {
+                    "entity_id": signal_entity_id,
+                    "name": "Signal Strength",
+                    "state": signal_pct,
+                    "unit_of_measurement": "%",
+                    "device_class": None,
+                    "category": "diagnostic",
+                    "sensor_key": f"signal_{hardware_id}",
+                    "hardware_id": hardware_id,
+                    "raw_value": signal,
+                    "attributes": {
+                        "sensor_key": f"signal_{hardware_id}",
+                        "last_update": datetime.now().isoformat(),
+                        "hardware_id": hardware_id,
+                        "signal": signal,
+                        "signal_percentage": signal_pct,
+                    },
+                }
+                _LOGGER.debug(
+                    "Added signal strength sensor for hardware_id: %s (signal: %s)",
+                    hardware_id,
+                    signal,
+                )
+
+            # Add RSSI and Signal Quality sensors from the raw dBm value in
+            # get_sensors_info. The bucketed "signal" field above (0-4) is too
+            # coarse to distinguish a marginal link from an excellent one — two
+            # sensors can both report signal=4 (100%) while one is at -36 dBm
+            # and the other at -101 dBm (issue #228).
+            raw_rssi = hardware_info.get("rssi")
+            try:
+                rssi_val = (
+                    int(str(raw_rssi).strip())
+                    if raw_rssi not in (None, "", "--")
+                    else None
+                )
+            except (TypeError, ValueError):
+                rssi_val = None
+
+            if rssi_val is not None:
+                rssi_entity_id = f"sensor.ecowitt_rssi_{hardware_id.lower()}"
+                sensors_data[rssi_entity_id] = {
+                    "entity_id": rssi_entity_id,
+                    "name": "RSSI",
+                    "state": rssi_val,
+                    "unit_of_measurement": "dBm",
+                    "device_class": "signal_strength",
+                    "state_class": "measurement",
+                    "category": "diagnostic",
+                    "sensor_key": f"rssi_{hardware_id}",
+                    "hardware_id": hardware_id,
+                    "raw_value": raw_rssi,
+                    "attributes": {
+                        "sensor_key": f"rssi_{hardware_id}",
+                        "last_update": datetime.now().isoformat(),
+                        "hardware_id": hardware_id,
+                        "rssi": raw_rssi,
+                    },
+                }
+
+                quality_pct = max(0, min(100, 2 * (rssi_val + 100)))
+                quality_entity_id = (
+                    f"sensor.ecowitt_signal_quality_{hardware_id.lower()}"
+                )
+                sensors_data[quality_entity_id] = {
+                    "entity_id": quality_entity_id,
+                    "name": "Signal Quality",
+                    "state": quality_pct,
+                    "unit_of_measurement": "%",
+                    "device_class": None,
+                    "state_class": "measurement",
+                    "category": "diagnostic",
+                    "sensor_key": f"signal_quality_{hardware_id}",
+                    "hardware_id": hardware_id,
+                    "raw_value": rssi_val,
+                    "attributes": {
+                        "sensor_key": f"signal_quality_{hardware_id}",
+                        "last_update": datetime.now().isoformat(),
+                        "hardware_id": hardware_id,
+                        "rssi": rssi_val,
+                        "formula": "2*(rssi_dbm+100), clamped 0-100 (linear, -100..-50 dBm)",
+                    },
+                }
+                _LOGGER.debug(
+                    "Added RSSI/signal quality sensors for hardware_id: %s "
+                    "(rssi: %s dBm, quality: %s%%)",
+                    hardware_id,
+                    rssi_val,
+                    quality_pct,
+                )
+
+            # Add Hardware ID diagnostic sensor
+            hardware_id_entity_id = f"sensor.ecowitt_hardware_id_{hardware_id.lower()}"
+            sensors_data[hardware_id_entity_id] = {
+                "entity_id": hardware_id_entity_id,
+                "name": "Hardware ID",
+                "state": hardware_id,
+                "unit_of_measurement": None,
+                "device_class": None,
+                "category": "diagnostic",
+                "sensor_key": f"hardware_id_{hardware_id}",
+                "hardware_id": hardware_id,
+                "raw_value": hardware_id,
+                "attributes": {
+                    "sensor_key": f"hardware_id_{hardware_id}",
+                    "last_update": datetime.now().isoformat(),
+                    "hardware_id": hardware_id,
+                    "entity_category": "diagnostic",
+                },
+            }
+
+            # Add battery entity from sensors_info for devices that don't emit a battery
+            # key in livedata (e.g. WH80 sends wh80batt via sensors_info only).
+            # Devices that handle battery in livedata (WS90, WH90, WS85, WH26, etc.)
+            # already have battery entities from _process_live_data — skip them.
+            #
+            # WH69/WH65/WN20/WH40 are also listed here even though they normally get
+            # their battery from the "rain" livedata block's 0x13 item: only whichever
+            # one of them wins that block's signal-based tie-break (see rain_list
+            # handling above) gets a battery entity from there. When more than one of
+            # these tipping-bucket devices is registered on the same gateway, the
+            # ones that don't win still report their own "batt" field in
+            # get_sensors_info, so this fallback (gated by the "already exists" check
+            # below) gives them a battery entity too instead of none at all — the
+            # regression reported in issue #239.
+            _SENSORS_INFO_BATTERY_KEYS: Dict[str, str] = {
+                "WH80": "wh80batt",
+                "WS80": "wh80batt",
+                "WN38": "wn38batt",
+                "WH69": "wh69batt",
+                "WH65": "wh69batt",
+                "WN20": "wn20batt",
+                "WH40": "wh40batt",
+            }
+            sensor_type = hardware_info.get("sensor_type", "")
+            fallback_batt_key = _SENSORS_INFO_BATTERY_KEYS.get(sensor_type.upper())
+            battery_raw = str(hardware_info.get("battery", "")).strip()
+            if fallback_batt_key and battery_raw and battery_raw not in ("", "--"):
+                # Only create if no battery entity for this hardware_id already exists
+                existing = any(
+                    s.get("sensor_key") == fallback_batt_key
+                    and s.get("hardware_id") == hardware_id
+                    for s in sensors_data.values()
+                )
+                if not existing:
+                    if fallback_batt_key in (
+                        "wh69batt",
+                        "wn20batt",
+                        "wh40batt",
+                    ) and battery_raw in ("0", "1"):
+                        # WH40/WN20 normally use 0-5 bar scale, WH69/WH65 use binary
+                        # (0=full, 1=low), but get_sensors_info's "batt" field doesn't
+                        # reliably normalize this for these tipping-bucket devices
+                        # (issue #239) - a raw value of 0 or 1 is ambiguous with the
+                        # bottom of the bar scale, so treat it as binary like the
+                        # rain-block extraction above does.
+                        battery_pct = "100" if battery_raw == "0" else "10"
+                    elif battery_raw.isdigit():
+                        battery_pct = str(int(battery_raw) * 20)
+                    else:
+                        battery_pct = battery_raw
+                    batt_entity_id, batt_name = self.sensor_mapper.generate_entity_id(
+                        fallback_batt_key, hardware_id
+                    )
+                    sensors_data[batt_entity_id] = {
+                        "entity_id": batt_entity_id,
+                        "name": batt_name,
+                        "state": battery_pct,
+                        "unit_of_measurement": "%",
+                        "device_class": "battery",
+                        "state_class": "measurement",
+                        "entity_category": None,
+                        "suggested_display_precision": None,
+                        "category": "diagnostic",
+                        "sensor_key": fallback_batt_key,
+                        "hardware_id": hardware_id,
+                        "raw_value": battery_raw,
+                        "attributes": {
+                            "sensor_key": fallback_batt_key,
+                            "last_update": datetime.now().isoformat(),
+                            "hardware_id": hardware_id,
+                        },
+                    }
+                    _LOGGER.debug(
+                        "Added fallback battery from sensors_info: %s = %s%% (hw: %s)",
+                        fallback_batt_key,
+                        battery_pct,
+                        hardware_id,
+                    )
+
+            # Add Channel diagnostic sensor (only for multi-channel sensors)
+            if channel:
+                channel_entity_id = f"sensor.ecowitt_channel_{hardware_id.lower()}"
+                sensors_data[channel_entity_id] = {
+                    "entity_id": channel_entity_id,
+                    "name": "Channel",
+                    "state": channel,
+                    "unit_of_measurement": None,
+                    "device_class": None,
+                    "category": "diagnostic",
+                    "sensor_key": f"channel_{hardware_id}",
+                    "hardware_id": hardware_id,
+                    "raw_value": channel,
+                    "attributes": {
+                        "sensor_key": f"channel_{hardware_id}",
+                        "last_update": datetime.now().isoformat(),
+                        "hardware_id": hardware_id,
+                        "channel": channel,
+                        "entity_category": "diagnostic",
+                    },
+                }
+
+            added_hardware_ids.add(hardware_id)
+            _LOGGER.debug(
+                "Added diagnostic sensors for hardware_id: %s (channel: %s, signal: %s)",
+                hardware_id,
+                channel,
+                signal,
+            )
+
+    def _normalize_unit(self, unit: str) -> str:
+        """Normalize unit string to Home Assistant standard format."""
+        if not unit:
+            return unit
+
+        unit_upper = unit.upper()
+
+        # Temperature
+        if unit_upper == "F":
+            return "°F"
+        elif unit_upper == "C":
+            return "°C"
+        # Irradiance - normalize W/m2 to W/m²
+        elif unit_upper == "W/M2":
+            return "W/m²"
+        # Precipitation intensity - normalize in/Hr to in/h
+        elif unit_upper == "IN/HR":
+            return "in/h"
+        elif unit_upper == "MM/HR":
+            return "mm/h"
+        # Pressure
+        elif unit_upper == "INHG":
+            return "inHg"
+        elif unit_upper == "HPA":
+            return "hPa"
+        # Speed
+        elif unit_upper == "MPH":
+            return "mph"
+        elif unit_upper == "KM/H" or unit_upper == "KPH":
+            return "km/h"
+        elif unit_upper == "M/S":
+            return "m/s"
+        elif unit_upper == "KNOTS" or unit_upper == "KN":
+            return "kn"
+        # Length/precipitation
+        elif unit_upper == "IN":
+            return "in"
+        elif unit_upper == "MM":
+            return "mm"
+        # Illuminance — normalize "Lux"/"lux" to HA standard "lx"
+        elif unit_upper == "LUX":
+            return "lx"
+        # Electrical conductivity — normalize "uS/cm" to HA standard "µS/cm"
+        elif unit_upper in ("US/CM", "µS/CM"):
+            return "µS/cm"
+
+        # Return original if no normalization needed
+        return unit
+
+    def _convert_sensor_value(self, value: Any, unit: Optional[str]) -> Any:
+        """Convert sensor value to appropriate type."""
+        if not value or value == "":
+            return None
+
+        try:
+            # Handle numeric values
+            if isinstance(value, (int, float)):
+                return value
+
+            # Try to convert string to number
+            str_value = str(value).strip()
+
+            # Handle special cases and invalid sensor readings
+            if (
+                str_value.lower() in ("--", "null", "none", "n/a")
+                or str_value.startswith("--")
+                or str_value.replace("-", "").replace(".", "").strip() == ""
+            ):
+                return None
+
+            # Handle values with embedded units (e.g., "29.40 inHg", "46.4 F", "89%")
+            import re
+
+            # Extract numeric part from strings with units
+            unit_match = re.match(r"^([-+]?\d*\.?\d+)\s*([a-zA-Z%/]+.*)?$", str_value)
+            if unit_match:
+                numeric_part = unit_match.group(1)
+                try:
+                    # Try integer first
+                    if "." not in numeric_part:
+                        return int(numeric_part)
+                    else:
+                        return float(numeric_part)
+                except ValueError:  # pragma: no cover
+                    pass
+
+            # Fallback to original logic for pure numeric strings
+            # Try integer first
+            try:
+                return int(str_value)
+            except ValueError:
+                pass
+
+            # Try float
+            try:
+                return float(str_value)
+            except ValueError:
+                pass
+
+            # Return as string if conversion fails
+            return str_value
+
+        except Exception as err:  # pragma: no cover
+            _LOGGER.debug("Error converting sensor value '%s': %s", value, err)
+            return str(value) if value else None
+
+    async def _process_gateway_info(self) -> Dict[str, Any]:
+        """Process gateway information."""
+        if not self._gateway_info:
+            try:
+                version_info = await self.api.get_version()
+                firmware_version = version_info.get("version", "Unknown")
+
+                # Extract model from firmware version (e.g., "GW1100A_V2.4.3" -> "GW1100A")
+                model = self._extract_model_from_firmware(firmware_version)
+                if not model or model == "Unknown":
+                    # Fallback to stationtype if model extraction fails
+                    model = version_info.get("stationtype", "Unknown")
+
+                # Use stationtype if available, else fall back to the model name.
+                # Some gateways (e.g. GW3000B) omit stationtype from /get_version.
+                gateway_id = version_info.get("stationtype") or model or "unknown"
+                self._gateway_info = {
+                    "model": model,
+                    "firmware_version": firmware_version,
+                    "host": self.config_entry.data[CONF_HOST],
+                    "gateway_id": gateway_id,
+                }
+            except Exception as err:
+                _LOGGER.warning("Failed to get gateway info: %s", err)
+                self._gateway_info = {
+                    "model": "Unknown",
+                    "firmware_version": "Unknown",
+                    "host": self.config_entry.data[CONF_HOST],
+                    "gateway_id": "unknown",
+                }
+
+        return self._gateway_info
+
+    def _extract_model_from_firmware(self, firmware_version: str) -> str:
+        """Extract gateway model from firmware version string.
+
+        Args:
+            firmware_version: Firmware version string (e.g., "GW1100A_V2.4.3")
+
+        Returns:
+            Gateway model (e.g., "GW1100A") or "Unknown" if extraction fails
+        """
+        return extract_model_from_firmware(firmware_version)
+
+    async def async_refresh_mapping(self) -> None:
+        """Force refresh of sensor mapping."""
+        await self._update_sensor_mapping()
+        await self.async_request_refresh()
+
+    async def async_setup(self) -> None:
+        """Set up the coordinator."""
+        try:
+            # Test initial connection
+            await self.api.test_connection()
+
+            # Do initial sensor mapping update
+            await self._update_sensor_mapping()
+
+            _LOGGER.info("Ecowitt Local coordinator setup complete")
+
+        except AuthenticationError as err:
+            raise ConfigEntryAuthFailed(f"Authentication failed: {err}") from err
+        except APIConnectionError as err:
+            raise ConfigEntryNotReady(f"Cannot connect to gateway: {err}") from err
+        except Exception as err:
+            _LOGGER.exception("Unexpected error during setup")
+            raise ConfigEntryNotReady(f"Setup failed: {err}") from err
+
+    async def async_shutdown(self) -> None:
+        """Shutdown the coordinator."""
+        # Cancel any pending refresh tasks
+        if hasattr(self, "_debounced_refresh"):
+            self._debounced_refresh.async_cancel()
+
+        # Cancel the refresh interval timer
+        if hasattr(self, "_unsub_refresh") and getattr(self, "_unsub_refresh", None):
+            unsub_refresh = getattr(self, "_unsub_refresh")
+            if unsub_refresh:
+                unsub_refresh()
+            setattr(self, "_unsub_refresh", None)
+
+        # Close the API connection
+        await self.api.close()
+
+    @property
+    def gateway_info(self) -> Dict[str, Any]:
+        """Get gateway information."""
+        return self._gateway_info
+
+    def get_sensor_data(self, entity_id: str) -> Optional[Dict[str, Any]]:
+        """Get sensor data for a specific entity."""
+        if not self.data:
+            return None
+        sensors_dict = self.data.get("sensors", {})
+        sensor_data = sensors_dict.get(entity_id)
+        if sensor_data is None:
+            # Try to find by iterating and matching by sensor_key for hex ID sensors.
+            # This handles entity_id mismatches during version-transition periods
+            # where the entity_id format changed between releases.
+            # Guard: also verify the sensor-type portion of the entity_id matches so
+            # that we never return e.g. "daily_rain" data for an "outdoor_humidity"
+            # entity — both share the same hardware_id suffix and the loose match
+            # caused incorrect unit-change HA repair notifications (issue #192).
+            for eid, sdata in sensors_dict.items():
+                if isinstance(sdata, dict):
+                    if sdata.get("sensor_key") and entity_id:
+                        stored_key = sdata.get("sensor_key", "")
+                        stored_hw_id = sdata.get("hardware_id", "")
+                        if stored_hw_id and stored_hw_id.lower() in entity_id.lower():
+                            if stored_key.startswith("0x"):
+                                # Only return when the sensor type is consistent
+                                # with the requested entity_id to avoid returning
+                                # e.g. daily_rain (mm) for outdoor_humidity (%).
+                                # Two cases both count as a match:
+                                #   1. Human-readable type name in the entity_id
+                                #      (current format: "ecowitt_outdoor_humidity_…")
+                                #   2. Raw hex key in the entity_id
+                                #      (legacy format: "ecowitt_0x07_…")
+                                sensor_type_name = (
+                                    self.sensor_mapper._extract_sensor_type_from_key(
+                                        stored_key
+                                    )
+                                )
+                                type_matches = (
+                                    sensor_type_name and sensor_type_name in entity_id
+                                ) or stored_key.lower() in entity_id.lower()
+                                if type_matches:
+                                    _LOGGER.debug(
+                                        "Found sensor by hardware_id match: %s -> %s",
+                                        entity_id,
+                                        eid,
+                                    )
+                                    return dict(sdata)
+            return None
+        return dict(sensor_data) if isinstance(sensor_data, dict) else None
+
+    def get_sensor_data_by_key(
+        self, sensor_key: str, hardware_id: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        """Get sensor data by sensor key and optional hardware ID.
+
+        This is a fallback method for finding sensor data when entity_id lookup fails,
+        which can happen with hex ID sensors during entity_id format transitions.
+        """
+        if not self.data:
+            return None
+        sensors_dict = self.data.get("sensors", {})
+
+        for eid, sdata in sensors_dict.items():
+            if isinstance(sdata, dict):
+                if sdata.get("sensor_key") == sensor_key:
+                    # If hardware_id specified, must match; otherwise any match works
+                    if hardware_id is None or sdata.get("hardware_id") == hardware_id:
+                        return dict(sdata)
+        return None
+
+    def get_all_sensors(self) -> Dict[str, Any]:
+        """Get all sensor data."""
+        if not self.data:
+            return {}
+        sensors_dict: Dict[str, Any] = self.data.get("sensors", {})
+        return sensors_dict
